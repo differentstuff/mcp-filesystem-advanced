@@ -13,25 +13,21 @@
   ],
   "scripts": {
     "build": "tsc && shx chmod +x dist/*.js",
-    "prepare": "npm run build",
     "watch": "tsc --watch",
-    "test": "vitest run --coverage",
+    "test": "vitest run",
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.26.0",
-    "diff": "^8.0.3",
-    "glob": "^10.5.0",
-    "minimatch": "^10.0.1",
-    "zod-to-json-schema": "^3.23.5"
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "diff": "^8.0.2",
+    "minimatch": "^10.0.3",
+    "zod-to-json-schema": "^3.24.6"
   },
   "devDependencies": {
-    "@types/diff": "^5.0.9",
-    "@types/minimatch": "^5.1.2",
-    "@types/node": "^22",
-    "@vitest/coverage-v8": "^2.1.8",
-    "shx": "^0.3.4",
-    "typescript": "^5.8.2",
-    "vitest": "^2.1.8"
+    "@types/diff": "^7.0.2",
+    "@types/node": "^22.15.21",
+    "shx": "^0.4.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
   }
 }

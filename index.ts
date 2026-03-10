@@ -30,8 +30,10 @@ import {
   ensureParentDirectory,
   createDirectoryRecursive,
   checkParentStatus,
+  withSubstrateLock,
   type WriteResult,
   type DirectoryResult,
+  type OperationType,
 } from './lib.js';
 
 // Command line argument parsing
