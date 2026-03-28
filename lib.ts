@@ -114,25 +114,16 @@ class SubstrateTracker {
 
   /**
    * Gets all paths that would be affected by an operation.
-   * For write operations, this includes the target and all parent directories.
+   * Locks only the exact file path being operated on.
+   * 
+   * Parent directory operations are handled atomically by the OS (mkdir -p),
+   * so we don't need to lock parent directories. This allows concurrent writes
+   * to different files in the same directory.
    */
   private getAffectedPaths(filePath: string, type: OperationType): string[] {
     const normalized = this.normalizePathForTracking(filePath);
-    const paths: string[] = [normalized];
-    
-    // For write/create operations, also track parent directories
-    // This prevents conflicts like: creating /a/b while writing /a/b/c.txt
-    if (type === 'write' || type === 'create') {
-      let current = path.dirname(normalized);
-      while (true) {
-        paths.push(current);
-        const parent = path.dirname(current);
-        if (parent === current) break;
-        current = parent;
-      }
-    }
-    
-    return paths;
+    // Lock only the exact file path being operated on
+    return [normalized];
   }
 
   /**
