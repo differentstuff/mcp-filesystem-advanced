@@ -48,6 +48,8 @@ logs/
 .env
 .env.local
 .env.*.local
+node_modules/
+package-lock.json
 
 # OS
 .DS_Store

@@ -703,14 +703,16 @@ server.on("connect", (event) => {
 });
 
 // Updates allowed directories based on MCP client roots
+// Merges client roots with command-line configured directories instead of replacing
 async function updateAllowedDirectoriesFromRoots(requestedRoots: any[]) {
   const validatedRootDirs = await getValidRootDirectories(requestedRoots);
   if (validatedRootDirs.length > 0) {
-    allowedDirectories = [...validatedRootDirs];
+    // Merge with existing directories, using Set to deduplicate
+    allowedDirectories = [...new Set([...allowedDirectories, ...validatedRootDirs])];
     setAllowedDirectories(allowedDirectories); // Update the global state in lib.ts
-    console.error(`Updated allowed directories from MCP roots: ${validatedRootDirs.length} valid directories`);
+    console.error(`Merged allowed directories from MCP roots: ${validatedRootDirs.length} new, ${allowedDirectories.length} total`);
   } else {
-    console.error("No valid root directories provided by client");
+    console.error("No valid root directories provided by client, keeping existing directories");
   }
 }
 
