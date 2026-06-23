@@ -6,6 +6,10 @@ import { diffLines, createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
 import { normalizePath, expandHome } from './path-utils.js';
 import { isPathWithinAllowedDirectories } from './path-validation.js';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 
 // Global allowed directories - set by the main module
 let allowedDirectories: string[] = [];
@@ -916,5 +920,469 @@ export async function searchFilesWithValidation(
   }
 
   await search(rootPath);
+  return results;
+}
+
+// ============================================================================
+// Grep / Content Search
+// ============================================================================
+
+/** Built-in default exclusion patterns for grep — always applied unless includeIgnored=true */
+const GREP_DEFAULT_EXCLUSIONS = [
+  'node_modules', '.git', '__pycache__', '.pytest_cache', '.mypy_cache',
+  '.ruff_cache', '.tox', '.venv', 'venv', 'env', 'virtualenv',
+  '*.egg-info', 'site-packages', 'dist', 'build', '.cache',
+  '.next', '.nuxt', '.svelte-kit', '*.min.js', '*.min.css', '*.min.map',
+  '*.lock', '.svn', '.hg', 'coverage', '.nyc_output', '.turbo',
+  'target', 'vendor',
+];
+
+const GREP_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const GREP_MAX_RESULTS_CEILING = 1000;
+const GREP_DEFAULT_MAX_RESULTS = 100;
+
+export interface GrepOptions {
+  excludePatterns?: string[];
+  includeIgnored?: boolean;
+  includeSnippet?: boolean;
+  contextLines?: number;
+  maxResults?: number;
+  filePattern?: string;
+}
+
+export interface GrepMatch {
+  path: string;
+  line: number;
+  snippet?: string;
+  contextBefore?: string[];
+  contextAfter?: string[];
+}
+
+export interface GrepResult {
+  matches: GrepMatch[];
+  truncated: boolean;
+  totalMatches: number;
+}
+
+/**
+ * Format a GrepResult into a string matching ripgrep-style output.
+ * Match lines use `:`, context lines use `-` after the line number.
+ */
+export function formatGrepResult(result: GrepResult, includeSnippet: boolean = true): string {
+  if (result.matches.length === 0) {
+    return 'No matches found';
+  }
+
+  const lines: string[] = [];
+
+  for (const match of result.matches) {
+    // Context before
+    if (match.contextBefore && match.contextBefore.length > 0) {
+      for (let i = 0; i < match.contextBefore.length; i++) {
+        const ctxLineNum = match.line - match.contextBefore.length + i;
+        if (includeSnippet) {
+          lines.push(`${match.path}:${ctxLineNum}-${match.contextBefore[i]}`);
+        } else {
+          lines.push(`${match.path}:${ctxLineNum}`);
+        }
+      }
+    }
+
+    // Match line
+    if (includeSnippet && match.snippet !== undefined) {
+      lines.push(`${match.path}:${match.line}:${match.snippet}`);
+    } else {
+      lines.push(`${match.path}:${match.line}`);
+    }
+
+    // Context after
+    if (match.contextAfter && match.contextAfter.length > 0) {
+      for (let i = 0; i < match.contextAfter.length; i++) {
+        const ctxLineNum = match.line + i + 1;
+        if (includeSnippet) {
+          lines.push(`${match.path}:${ctxLineNum}-${match.contextAfter[i]}`);
+        } else {
+          lines.push(`${match.path}:${ctxLineNum}`);
+        }
+      }
+    }
+  }
+
+  if (result.truncated) {
+    lines.push(
+      `# truncated: showing ${result.matches.length} of ${result.totalMatches} matches. Refine pattern, narrow filePattern, or raise maxResults.`
+    );
+  }
+
+  return lines.join('\n');
+}
+
+// Cache ripgrep availability across calls
+let _rgAvailable: boolean | null = null;
+
+async function isRipgrepAvailable(): Promise<boolean> {
+  if (_rgAvailable !== null) return _rgAvailable;
+  try {
+    await execFileAsync('rg', ['--version']);
+    _rgAvailable = true;
+  } catch {
+    _rgAvailable = false;
+  }
+  return _rgAvailable;
+}
+
+/**
+ * Check if a file appears to be binary by sampling the first 8KB for null bytes.
+ */
+async function isBinaryFile(filePath: string): Promise<boolean> {
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(8192);
+    const { bytesRead } = await handle.read(buffer, 0, 8192, 0);
+    return buffer.slice(0, bytesRead).includes(0);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Search file contents for a pattern. Uses ripgrep (rg) as primary engine
+ * with an in-process streaming fallback when rg is not on PATH.
+ */
+export async function grepFilesWithValidation(
+  rootPath: string,
+  pattern: string,
+  allowedDirectories: string[],
+  options: GrepOptions = {}
+): Promise<GrepResult> {
+  const {
+    excludePatterns = [],
+    includeIgnored = false,
+    contextLines = 0,
+    maxResults = GREP_DEFAULT_MAX_RESULTS,
+    filePattern,
+  } = options;
+
+  // Cap maxResults to hard ceiling
+  const cappedMax = Math.min(Math.max(1, maxResults), GREP_MAX_RESULTS_CEILING);
+
+  // Validate root path
+  const validRootPath = await validatePath(rootPath);
+
+  // Try ripgrep first, fall back to native
+  if (await isRipgrepAvailable()) {
+    return grepWithRipgrep(validRootPath, pattern, {
+      excludePatterns,
+      includeIgnored,
+      contextLines,
+      maxResults: cappedMax,
+      filePattern,
+    });
+  }
+
+  return grepWithNativeFallback(validRootPath, pattern, allowedDirectories, {
+    excludePatterns,
+    includeIgnored,
+    contextLines,
+    maxResults: cappedMax,
+    filePattern,
+  });
+}
+
+/**
+ * Ripgrep-based content search.
+ */
+async function grepWithRipgrep(
+  rootPath: string,
+  pattern: string,
+  options: {
+    excludePatterns: string[];
+    includeIgnored: boolean;
+    contextLines: number;
+    maxResults: number;
+    filePattern?: string;
+  }
+): Promise<GrepResult> {
+  const { excludePatterns, includeIgnored, contextLines, maxResults, filePattern } = options;
+
+  const args: string[] = [
+    '--no-heading',
+    '--line-number',
+    '--color', 'never',
+    '--smart-case',
+    '--max-filesize', String(GREP_MAX_FILE_SIZE),
+    '-m', String(maxResults + 1), // +1 to detect per-file truncation
+  ];
+
+  // Bypass .gitignore / .rgignore when includeIgnored is true
+  if (includeIgnored) {
+    args.push('--no-ignore');
+  }
+
+  // Built-in exclusions (unless includeIgnored)
+  if (!includeIgnored) {
+    for (const excl of GREP_DEFAULT_EXCLUSIONS) {
+      args.push('--glob', `!${excl}`);
+    }
+  }
+
+  // User exclusions (always additive)
+  for (const excl of excludePatterns) {
+    args.push('--glob', `!${excl}`);
+  }
+
+  // File pattern restriction
+  if (filePattern) {
+    args.push('--glob', filePattern);
+  }
+
+  // Context lines
+  if (contextLines > 0) {
+    args.push('-C', String(contextLines));
+  }
+
+  // Pattern and path
+  args.push('--', pattern, rootPath);
+
+  try {
+    const { stdout } = await execFileAsync('rg', args, {
+      maxBuffer: 50 * 1024 * 1024, // 50MB buffer
+      timeout: 30000,
+    });
+
+    return parseRipgrepOutput(stdout, maxResults, contextLines > 0);
+  } catch (error: any) {
+    // rg exit code 1 = no matches found
+    if (error.code === 1) {
+      return { matches: [], truncated: false, totalMatches: 0 };
+    }
+    // rg exit code 2 = error (bad regex, permission denied, etc.)
+    if (error.code === 2) {
+      const errMsg = error.stderr || error.message;
+      if (errMsg.includes('regex') || errMsg.includes('pattern')) {
+        throw new Error(`Invalid search pattern: ${errMsg}`);
+      }
+      throw new Error(`ripgrep error: ${errMsg}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Parse ripgrep output into a GrepResult.
+ * Match lines:  path:lineno:content
+ * Context lines: path:lineno-content
+ */
+function parseRipgrepOutput(output: string, maxResults: number, hasContext: boolean): GrepResult {
+  const matches: GrepMatch[] = [];
+  const outputLines = output.split('\n');
+
+  let currentMatch: GrepMatch | null = null;
+
+  for (const line of outputLines) {
+    if (line === '') continue;
+    // Context separator between non-contiguous groups — skip
+    if (line === '--') continue;
+
+    // Match line: path:lineno:content
+    const matchLine = line.match(/^(.+?):(\d+):(.*)$/);
+    if (matchLine) {
+      currentMatch = {
+        path: matchLine[1],
+        line: parseInt(matchLine[2], 10),
+        snippet: matchLine[3],
+      };
+      if (hasContext) {
+        currentMatch.contextBefore = [];
+        currentMatch.contextAfter = [];
+      }
+      matches.push(currentMatch);
+      continue;
+    }
+
+    // Context line: path:lineno-content
+    const ctxLine = line.match(/^(.+?):(\d+)-(.*)$/);
+    if (ctxLine && currentMatch && hasContext) {
+      const ctxLineNum = parseInt(ctxLine[2], 10);
+      if (ctxLineNum < currentMatch.line) {
+        currentMatch.contextBefore!.push(ctxLine[3]);
+      } else {
+        currentMatch.contextAfter!.push(ctxLine[3]);
+      }
+    }
+  }
+
+  const truncated = matches.length > maxResults;
+  const finalMatches = truncated ? matches.slice(0, maxResults) : matches;
+
+  return {
+    matches: finalMatches,
+    truncated,
+    totalMatches: matches.length,
+  };
+}
+
+/**
+ * Native in-process content search fallback (when ripgrep is not available).
+ * Walks the directory tree, skips binary/oversized/excluded files, and
+ * searches each text file line-by-line.
+ */
+async function grepWithNativeFallback(
+  rootPath: string,
+  pattern: string,
+  allowedDirectories: string[],
+  options: {
+    excludePatterns: string[];
+    includeIgnored: boolean;
+    contextLines: number;
+    maxResults: number;
+    filePattern?: string;
+  }
+): Promise<GrepResult> {
+  const { excludePatterns, includeIgnored, contextLines, maxResults, filePattern } = options;
+
+  // Smart-case: case-insensitive when pattern has no uppercase letters
+  const hasUppercase = /[A-Z]/.test(pattern);
+  let regex: RegExp;
+  try {
+    regex = new RegExp(pattern, hasUppercase ? '' : 'i');
+  } catch (e) {
+    throw new Error(
+      `Invalid search pattern: ${pattern}. ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+
+  // Build combined exclusion list
+  const allExclusions = includeIgnored
+    ? [...excludePatterns]
+    : [...GREP_DEFAULT_EXCLUSIONS, ...excludePatterns];
+
+  const matches: GrepMatch[] = [];
+  let totalFound = 0;
+  let truncated = false;
+
+  async function searchDir(currentPath: string): Promise<void> {
+    if (truncated) return;
+
+    let entries;
+    try {
+      entries = await fs.readdir(currentPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (truncated) return;
+
+      const fullPath = path.join(currentPath, entry.name);
+      const relativePath = path.relative(rootPath, fullPath);
+
+      // Check exclusions
+      const shouldExclude = allExclusions.some(excl =>
+        minimatch(relativePath, excl, { dot: true }) ||
+        minimatch(entry.name, excl, { dot: true })
+      );
+      if (shouldExclude) continue;
+
+      // Validate path is within allowed directories
+      try {
+        const normalizedFullPath = normalizePath(path.resolve(fullPath));
+        if (!isPathWithinAllowedDirectories(normalizedFullPath, allowedDirectories)) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        await searchDir(fullPath);
+      } else if (entry.isFile()) {
+        // Check file pattern
+        if (filePattern) {
+          const matchesGlob =
+            minimatch(relativePath, filePattern, { dot: true }) ||
+            minimatch(entry.name, filePattern, { dot: true });
+          if (!matchesGlob) continue;
+        }
+
+        // Check file size
+        try {
+          const stats = await fs.stat(fullPath);
+          if (stats.size > GREP_MAX_FILE_SIZE || stats.size === 0) continue;
+        } catch {
+          continue;
+        }
+
+        // Check if binary
+        try {
+          if (await isBinaryFile(fullPath)) continue;
+        } catch {
+          continue;
+        }
+
+        // Search file content
+        try {
+          const fileMatches = await searchFileLines(fullPath, regex, contextLines);
+          for (const m of fileMatches) {
+            totalFound++;
+            if (totalFound <= maxResults) {
+              matches.push(m);
+            } else {
+              truncated = true;
+            }
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+  }
+
+  await searchDir(rootPath);
+
+  return {
+    matches,
+    truncated,
+    totalMatches: totalFound,
+  };
+}
+
+/**
+ * Search a single file's lines for a regex pattern.
+ */
+async function searchFileLines(
+  filePath: string,
+  regex: RegExp,
+  contextLines: number
+): Promise<GrepMatch[]> {
+  const content = await fs.readFile(filePath, 'utf-8');
+  const lines = content.split('\n');
+  const results: GrepMatch[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    // Reset lastIndex in case regex has 'g' flag
+    regex.lastIndex = 0;
+    if (regex.test(lines[i])) {
+      const match: GrepMatch = {
+        path: filePath,
+        line: i + 1, // 1-based line numbers
+        snippet: lines[i],
+      };
+
+      if (contextLines > 0) {
+        match.contextBefore = [];
+        match.contextAfter = [];
+        for (let j = Math.max(0, i - contextLines); j < i; j++) {
+          match.contextBefore.push(lines[j]);
+        }
+        for (let j = i + 1; j < Math.min(lines.length, i + 1 + contextLines); j++) {
+          match.contextAfter.push(lines[j]);
+        }
+      }
+
+      results.push(match);
+    }
+  }
+
   return results;
 }
