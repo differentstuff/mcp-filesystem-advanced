@@ -164,9 +164,22 @@ For any MCP-compatible client:
 | `list_directory_with_sizes` | List with file sizes |
 | `directory_tree` | Get recursive tree structure |
 | `move_file` | Move/rename files or directories |
-| `search_files` | Search with glob patterns |
+| `search_files` | Search file/directory **names** by glob pattern |
+| `grep_files` | Search file **contents** for a pattern |
 | `get_file_info` | Get file metadata |
 | `list_allowed_directories` | Show accessible directories |
+
+### When to Use Which Search Tool
+
+| You want to… | Use | Example |
+|---------------|-----|---------|
+| Find files by name or extension | `search_files` | `pattern: "*.py"` → all Python files |
+| Find where a function/variable/string is defined | `grep_files` | `pattern: "def my_function"` → content matches |
+| Locate a file when you know part of its path | `search_files` | `pattern: "**/config.yaml"` → path matches |
+| Find all usages of an import or API call | `grep_files` | `pattern: "from os import"`, `filePattern: "*.py"` |
+| Get an overview of project structure | `directory_tree` | Recursive tree view |
+
+**Key distinction:** `search_files` matches file/directory **names** (glob on paths). `grep_files` opens files and matches **content** (regex on text).
 
 ## Enhanced Behavior
 
