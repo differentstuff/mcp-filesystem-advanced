@@ -28,6 +28,9 @@ import {
   type WriteResult,
   type DirectoryResult,
   type OperationType,
+  // Grep / content search
+  grepFilesWithValidation,
+  formatGrepResult,
 } from './lib.js';
 
 // Command line argument parsing
@@ -159,6 +162,23 @@ const SearchFilesArgsSchema = z.object({
   path: z.string(),
   pattern: z.string(),
   excludePatterns: z.array(z.string()).optional().default([])
+});
+
+const GrepFilesArgsSchema = z.object({
+  path: z.string().describe('Directory to search in'),
+  pattern: z.string().describe('Content search pattern (supports regex syntax). Use this to find where a function, variable, string, or pattern is defined or used.'),
+  excludePatterns: z.array(z.string()).optional().default([])
+    .describe('Additional glob patterns to exclude (additive to built-in defaults like node_modules, .git, venv, etc.)'),
+  includeIgnored: z.boolean().optional().default(false)
+    .describe('If true, bypass built-in default exclusions (e.g., node_modules, .git, venv, *.lock, etc.) and .gitignore. Use when you know what you are looking for is in an excluded directory.'),
+  includeSnippet: z.boolean().optional().default(true)
+    .describe('If true (default), include the matching line content in results. Set to false for path:lineNumber only.'),
+  contextLines: z.number().optional().default(0)
+    .describe('Number of context lines to show before and after each match. Default 0 (match line only).'),
+  maxResults: z.number().optional().default(100)
+    .describe('Maximum number of matches to return. Default 100, hard ceiling 1000.'),
+  filePattern: z.string().optional()
+    .describe('Glob pattern to restrict which files to search (e.g., "*.py", "*.{ts,js}"). Intersected with the content search.'),
 });
 
 const GetFileInfoArgsSchema = z.object({
@@ -634,10 +654,11 @@ server.addTool({
 server.addTool({
   name: "search_files",
   description:
-    "Recursively search for files and directories matching a pattern. " +
-    "The patterns should be glob-style patterns that match paths relative to the working directory. " +
-    "Use pattern like '*.ext' to match files in current directory, and '**/*.ext' to match files in all subdirectories. " +
-    "Returns full paths to all matching items. Great for finding files when you don't know their exact location. " +
+    "Recursively search for files and directories matching a glob pattern on their PATHS. " +
+    "This tool matches file and directory NAMES only — it does NOT open or read file contents. " +
+    "Use pattern like '*.ext' to match files by extension, and '**/*.ext' to match in all subdirectories. " +
+    "To search file CONTENTS (e.g., find where a function or string is defined), use grep_files instead. " +
+    "Returns full paths to all matching items. " +
     "Only searches within allowed directories.",
   parameters: z.object({
     path: z.string(),
@@ -648,6 +669,40 @@ server.addTool({
     const validPath = await validatePath(args.path);
     const results = await searchFilesWithValidation(validPath, args.pattern, allowedDirectories, { excludePatterns: args.excludePatterns });
     return results.length > 0 ? results.join("\n") : "No matches found";
+  },
+  annotations: { readOnlyHint: true }
+});
+
+server.addTool({
+  name: "grep_files",
+  description:
+    "Search file contents for a pattern. " +
+    "Unlike search_files which only matches file/directory names by glob pattern, " +
+    "this tool opens files and searches their content. " +
+    "Use this when you need to find where a function, variable, string, or pattern " +
+    "is defined or used in the codebase. " +
+    "Returns matches in the format: path:lineNumber:snippet (or path:lineNumber when includeSnippet is false). " +
+    "Supports regex syntax for the search pattern; simple strings work as-is. " +
+    "Automatically skips binary files, files over 10MB, and common non-code directories " +
+    "(node_modules, .git, __pycache__, venv, *.lock, etc.) unless includeIgnored is true. " +
+    "Use filePattern to restrict search to specific file types (e.g., '*.py', '*.{ts,js}'). " +
+    "Only searches within allowed directories.",
+  parameters: GrepFilesArgsSchema,
+  execute: async (args: z.infer<typeof GrepFilesArgsSchema>) => {
+    const result = await grepFilesWithValidation(
+      args.path,
+      args.pattern,
+      allowedDirectories,
+      {
+        excludePatterns: args.excludePatterns,
+        includeIgnored: args.includeIgnored,
+        includeSnippet: args.includeSnippet,
+        contextLines: args.contextLines,
+        maxResults: args.maxResults,
+        filePattern: args.filePattern,
+      }
+    );
+    return formatGrepResult(result, args.includeSnippet);
   },
   annotations: { readOnlyHint: true }
 });
