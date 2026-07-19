@@ -366,6 +366,7 @@ server.addTool({
   description:
     "Make line-based edits to a text file. Each edit replaces exact line sequences " +
     "with new content. Returns a git-style diff showing the changes made. " +
+    "On failure, returns EDIT_FAILED with a line-number hint — read the file at that location and retry with the correct oldText. " +
     "Only works within allowed directories.",
   parameters: z.object({
     path: z.string(),

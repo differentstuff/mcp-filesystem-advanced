@@ -700,6 +700,32 @@ interface FileEdit {
   newText: string;
 }
 
+/**
+ * Generate a line-number hint for a failed edit.
+ * Scans the original file content for the first non-empty line of oldText
+ * and reports a candidate line range + 60-char snippet.
+ * Returns 'no close match found' if nothing matches.
+ */
+function generateEditHint(fileContent: string, oldText: string): string {
+  const oldLines = oldText.split('\n');
+  const firstNonEmpty = oldLines.find(l => l.trim().length > 0);
+  if (!firstNonEmpty) {
+    return 'oldText is empty or whitespace-only';
+  }
+  const searchKey = firstNonEmpty.trim();
+  const fileLines = fileContent.split('\n');
+
+  for (let i = 0; i < fileLines.length; i++) {
+    if (fileLines[i].trim() === searchKey) {
+      const startLine = i + 1; // 1-based
+      const endLine = Math.min(startLine + oldLines.length - 1, fileLines.length);
+      const snippet = fileLines[i].substring(0, 60);
+      return `line ${startLine}-${endLine}: ${snippet}`;
+    }
+  }
+  return `no close match found for: "${searchKey.substring(0, 60)}"`;
+}
+
 export async function applyFileEdits(
   filePath: string,
   edits: FileEdit[],
@@ -757,7 +783,15 @@ export async function applyFileEdits(
     }
 
     if (!matchFound) {
-      throw new Error(`Could not find exact match for edit:\n${edit.oldText}`);
+      const hint = generateEditHint(content, normalizedOld);
+      throw new Error(
+        `EDIT_FAILED\n` +
+        `  file: ${filePath}\n` +
+        `  reason: oldText not found in file (exact match and whitespace-flexible match both failed)\n` +
+        `  hint: ${hint}\n` +
+        `  next_step: Read the file at the hinted location, then retry the edit with the correct oldText\n` +
+        `  no changes were written`
+      );
     }
   }
 
