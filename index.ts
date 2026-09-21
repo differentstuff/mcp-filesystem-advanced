@@ -261,11 +261,7 @@ server.addTool({
     "the first N lines of a file, or the 'tail' parameter to read only " +
     "the last N lines of a file. Operates on the file as text regardless of extension. " +
     "Only works within allowed directories.",
-  parameters: z.object({
-    path: z.string(),
-    tail: z.number().optional().describe("If provided, returns only the last N lines of the file"),
-    head: z.number().optional().describe("If provided, returns only the first N lines of the file")
-  }),
+  parameters: ReadTextFileArgsSchema,
   execute: readTextFileHandler,
   annotations: { readOnlyHint: true }
 });
