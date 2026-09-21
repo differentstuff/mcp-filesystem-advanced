@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import { promisify } from 'util';
 import {
   // Pure utility functions
   formatSize,
@@ -310,10 +311,12 @@ describe('Lib Functions', () => {
         mockFs.realpath.mockImplementation(async (p: any) => p.toString());
         // Parent directory exists — writeFileContent only auto-creates missing parents
         mockFs.stat.mockResolvedValue({ isDirectory: () => true } as any);
-        const result = await writeFileContent('/allowed/file.txt', 'new content');
-        
-        expect(mockFs.writeFile).toHaveBeenCalledWith('/allowed/file.txt', 'new content', { encoding: "utf-8", flag: 'wx' });
-        expect(result.path).toBe('/allowed/file.txt');
+        // Platform-aware: validatePath normalizes to native separators (win32 → backslashes)
+        const filePath = process.platform === 'win32' ? 'C:\\allowed\\file.txt' : '/allowed/file.txt';
+        const result = await writeFileContent(filePath, 'new content');
+
+        expect(mockFs.writeFile).toHaveBeenCalledWith(filePath, 'new content', { encoding: "utf-8", flag: 'wx' });
+        expect(result.path).toBe(filePath);
         expect(result.parentDirsCreated).toEqual([]);
       });
 
@@ -741,10 +744,20 @@ describe('Lib Functions', () => {
   describe('grepFilesWithValidation', () => {
     beforeEach(() => {
       mockFs.realpath.mockImplementation(async (p: any) => p.toString());
-      // Force native fallback: simulate ripgrep not on PATH
+      // Force native fallback deterministically: the availability probe must
+      // fail on every path promisify may have bound to. Node's execFile
+      // carries a util.promisify.custom implementation that the automock
+      // preserves — promisify() returns THAT function directly, bypassing
+      // the callback-style mock below. Cover both.
       mockCp.mockImplementation((_cmd: any, _args: any, cb: any) => {
         cb(new Error('ripgrep not found'));
       });
+      const customPromisified = mockCp[promisify.custom];
+      if (typeof customPromisified?.mockImplementation === 'function') {
+        customPromisified.mockImplementation(() =>
+          Promise.reject(new Error('ripgrep not found'))
+        );
+      }
     });
 
     it('searches a single file when the path points to a file (regression: silent ENOTDIR false negative)', async () => {
@@ -755,9 +768,16 @@ describe('Lib Functions', () => {
         isFile: () => true
       } as any);
 
-      // Binary sniff (isBinaryFile reads first 8KB): return non-null bytes
+      // Binary sniff (isBinaryFile reads first 8KB): emulate real fs.read by
+      // writing the file bytes INTO the caller-supplied buffer. Returning a
+      // separate buffer in the result object would leave the zero-filled
+      // buffer untouched, and isBinaryFile would see null bytes → "binary".
+      const fileBytes = Buffer.from('ok');
       const mockFileHandle = {
-        read: vi.fn().mockResolvedValue({ bytesRead: 2, buffer: Buffer.from('ok') }),
+        read: vi.fn(async (buf: Buffer, offset: number, length: number) => {
+          fileBytes.copy(buf, offset, 0, Math.min(length, fileBytes.length));
+          return { bytesRead: fileBytes.length, buffer: buf };
+        }),
         close: vi.fn().mockResolvedValue(undefined)
       } as any;
       mockFs.open.mockResolvedValue(mockFileHandle);
@@ -802,9 +822,15 @@ describe('Lib Functions', () => {
         isFile: () => true
       } as any);
 
-      // Binary sniff (isBinaryFile reads first 8KB): buffer contains a null byte
+      // Binary sniff (isBinaryFile reads first 8KB): file bytes written into
+      // the caller-supplied buffer (see mock read semantics above) contain a
+      // null byte → reported as binary.
+      const binaryBytes = Buffer.from('a\0bc');
       const mockFileHandle = {
-        read: vi.fn().mockResolvedValue({ bytesRead: 4, buffer: Buffer.from('a\0bc') }),
+        read: vi.fn(async (buf: Buffer, offset: number, length: number) => {
+          binaryBytes.copy(buf, offset, 0, Math.min(length, binaryBytes.length));
+          return { bytesRead: binaryBytes.length, buffer: buf };
+        }),
         close: vi.fn().mockResolvedValue(undefined)
       } as any;
       mockFs.open.mockResolvedValue(mockFileHandle);

@@ -1111,8 +1111,11 @@ let _rgAvailable: boolean | null = null;
 async function isRipgrepAvailable(): Promise<boolean> {
   if (_rgAvailable !== null) return _rgAvailable;
   try {
-    await execFileAsync('rg', ['--version']);
-    _rgAvailable = true;
+    // Verify the evidence, not just the absence of an error: an exec layer
+    // that resolves without output (e.g. under test mocks) must NOT count as
+    // "available" — grepWithRipgrep would crash destructuring the result.
+    const { stdout } = await execFileAsync('rg', ['--version']);
+    _rgAvailable = typeof stdout === 'string' && stdout.includes('ripgrep');
   } catch {
     _rgAvailable = false;
   }
