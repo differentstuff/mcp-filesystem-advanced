@@ -307,9 +307,19 @@ describe('Lib Functions', () => {
       it('writes file content', async () => {
         mockFs.writeFile.mockResolvedValueOnce(undefined);
         
-        await writeFileContent('/test/file.txt', 'new content');
+        mockFs.realpath.mockImplementation(async (p: any) => p.toString());
+        // Parent directory exists — writeFileContent only auto-creates missing parents
+        mockFs.stat.mockResolvedValue({ isDirectory: () => true } as any);
+        const result = await writeFileContent('/allowed/file.txt', 'new content');
         
-        expect(mockFs.writeFile).toHaveBeenCalledWith('/test/file.txt', 'new content', { encoding: "utf-8", flag: 'wx' });
+        expect(mockFs.writeFile).toHaveBeenCalledWith('/allowed/file.txt', 'new content', { encoding: "utf-8", flag: 'wx' });
+        expect(result.path).toBe('/allowed/file.txt');
+        expect(result.parentDirsCreated).toEqual([]);
+      });
+
+      it('rejects paths outside allowed directories', async () => {
+        await expect(writeFileContent('/test/file.txt', 'new content'))
+          .rejects.toThrow('Access denied - path outside allowed directories');
       });
     });
 
@@ -352,7 +362,7 @@ describe('Lib Functions', () => {
         expect(result).toEqual([expectedResult]);
       });
 
-      it('handles validation errors during search', async () => {
+      it('throws with incomplete-results notice when validation fails during search', async () => {
         const mockEntries = [
           { name: 'test.txt', isDirectory: () => false },
           { name: 'invalid_file.txt', isDirectory: () => false }
@@ -371,16 +381,17 @@ describe('Lib Functions', () => {
         const testDir = process.platform === 'win32' ? 'C:\\allowed\\dir' : '/allowed/dir';
         const allowedDirs = process.platform === 'win32' ? ['C:\\allowed'] : ['/allowed'];
         
-        const result = await searchFilesWithValidation(
+        const error = await searchFilesWithValidation(
           testDir,
           '*test*',
           allowedDirs,
           {}
-        );
+        ).catch((e: Error) => e);
+        expect(error).toBeInstanceOf(Error);
+        expect(error.message).toMatch(/search incomplete/);
+        expect(error.message).toMatch(/invalid_file\.txt: Access denied/);
         
-        // Should only return the valid file, skipping the invalid one
-        const expectedResult = process.platform === 'win32' ? 'C:\\allowed\\dir\\test.txt' : '/allowed/dir/test.txt';
-        expect(result).toEqual([expectedResult]);
+        // (Old swallow-behavior assertions removed — the notify contract is asserted above.)
       });
 
       it('handles complex exclude patterns with wildcards', async () => {
@@ -731,7 +742,7 @@ describe('Lib Functions', () => {
     beforeEach(() => {
       mockFs.realpath.mockImplementation(async (p: any) => p.toString());
       // Force native fallback: simulate ripgrep not on PATH
-      mockCp.execFile.mockImplementation((_cmd: any, _args: any, cb: any) => {
+      mockCp.mockImplementation((_cmd: any, _args: any, cb: any) => {
         cb(new Error('ripgrep not found'));
       });
     });

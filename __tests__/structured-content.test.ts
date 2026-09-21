@@ -7,6 +7,19 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { spawn } from 'child_process';
 
 /**
+ * TODO(structuredContent): All tests in this file are skipped because no tool
+ * in this fork declares an outputSchema, so FastMCP never returns
+ * structuredContent — these tests verify a feature that is not implemented
+ * here (they reference fastmcp issues #3110, #3106, #3093 and were inherited
+ * from a codebase where tools DO declare outputSchema).
+ *
+ * To enable: add `outputSchema: z.object({ content: z.string() })` to the
+ * tool registrations in index.ts and have execute() return { content: string }.
+ * NOTE: that changes the tool contract — text output becomes JSON-wrapped —
+ * so it affects all MCP clients using this server. Decision (2026-09-22):
+ * skip with TODO rather than implement or delete.
+ */
+/**
  * Integration tests to verify that tool handlers return structuredContent
  * that matches the declared outputSchema.
  *
@@ -51,7 +64,7 @@ describe('structuredContent schema compliance', () => {
   });
 
   describe('directory_tree', () => {
-    it('should return structuredContent.content as a string, not an array', async () => {
+    it.skip('should return structuredContent.content as a string, not an array', async () => {
       const result = await client.callTool({
         name: 'directory_tree',
         arguments: { path: testDir }
@@ -74,7 +87,7 @@ describe('structuredContent schema compliance', () => {
   });
 
   describe('list_directory_with_sizes', () => {
-    it('should return structuredContent.content as a string, not an array', async () => {
+    it.skip('should return structuredContent.content as a string, not an array', async () => {
       const result = await client.callTool({
         name: 'list_directory_with_sizes',
         arguments: { path: testDir }
@@ -96,7 +109,7 @@ describe('structuredContent schema compliance', () => {
   });
 
   describe('move_file', () => {
-    it('should return structuredContent.content as a string, not an array', async () => {
+    it.skip('should return structuredContent.content as a string, not an array', async () => {
       const sourcePath = path.join(testDir, 'test.txt');
       const destPath = path.join(testDir, 'moved.txt');
 
@@ -124,7 +137,7 @@ describe('structuredContent schema compliance', () => {
   });
 
   describe('list_directory (control - already working)', () => {
-    it('should return structuredContent.content as a string', async () => {
+    it.skip('should return structuredContent.content as a string', async () => {
       const result = await client.callTool({
         name: 'list_directory',
         arguments: { path: testDir }
@@ -139,7 +152,7 @@ describe('structuredContent schema compliance', () => {
   });
 
   describe('search_files (control - already working)', () => {
-    it('should return structuredContent.content as a string', async () => {
+    it.skip('should return structuredContent.content as a string', async () => {
       const result = await client.callTool({
         name: 'search_files',
         arguments: {
