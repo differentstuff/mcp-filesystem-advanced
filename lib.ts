@@ -105,8 +105,11 @@ class SubstrateTracker {
 
   constructor(timeoutMs: number = 30000) {
     this.operationTimeout = timeoutMs;
-    // Clean up stale operations periodically
-    setInterval(() => this.cleanupStaleOperations(), 5000);
+    // Clean up stale operations periodically.
+    // unref(): the timer must not keep the process alive on shutdown —
+    // the MCP stdio transport owns process lifetime.
+    const interval = setInterval(() => this.cleanupStaleOperations(), 5000);
+    if (typeof interval.unref === 'function') interval.unref();
   }
 
   /**
@@ -922,6 +925,14 @@ export async function searchFilesWithValidation(
 ): Promise<string[]> {
   const { excludePatterns = [] } = options;
   const results: string[] = [];
+  // Notification policy: per-path validation failures are collected and
+  // surfaced as an error — never silently skipped. A partial result set
+  // that looks complete is the failure mode that cost us a week of
+  // "grep is unreliable" debugging. Exception: symlinks resolving outside
+  // allowed directories are an intentional security skip (documented in
+  // README; matches ripgrep's no-follow default) and are not reported.
+  const validationErrors: string[] = [];
+  const MAX_REPORTED = 5;
 
   async function search(currentPath: string) {
     const entries = await fs.readdir(currentPath, { withFileTypes: true });
@@ -931,29 +942,46 @@ export async function searchFilesWithValidation(
 
       try {
         await validatePath(fullPath);
-
-        const relativePath = path.relative(rootPath, fullPath);
-        const shouldExclude = excludePatterns.some(excludePattern =>
-          minimatch(relativePath, excludePattern, { dot: true })
-        );
-
-        if (shouldExclude) continue;
-
-        // Use glob matching for the search pattern
-        if (minimatch(relativePath, pattern, { dot: true })) {
-          results.push(fullPath);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!msg.includes('symlink')) {
+          validationErrors.push(`${fullPath}: ${msg}`);
         }
-
-        if (entry.isDirectory()) {
-          await search(fullPath);
-        }
-      } catch {
         continue;
+      }
+
+      const relativePath = path.relative(rootPath, fullPath);
+      const shouldExclude = excludePatterns.some(excludePattern =>
+        minimatch(relativePath, excludePattern, { dot: true })
+      );
+
+      if (shouldExclude) continue;
+
+      // Use glob matching for the search pattern
+      if (minimatch(relativePath, pattern, { dot: true })) {
+        results.push(fullPath);
+      }
+
+      if (entry.isDirectory()) {
+        await search(fullPath);
       }
     }
   }
 
   await search(rootPath);
+
+  if (validationErrors.length > 0) {
+    const shown = validationErrors.slice(0, MAX_REPORTED).join('; ');
+    const more = validationErrors.length > MAX_REPORTED
+      ? ` (+${validationErrors.length - MAX_REPORTED} more)`
+      : '';
+    throw new Error(
+      `search incomplete: ${validationErrors.length} path(s) failed validation and were NOT searched. ` +
+      `Results above may be partial. Affected: ${shown}${more}. ` +
+      `Retrying with excludePatterns for the affected paths will produce a complete result.`
+    );
+  }
+
   return results;
 }
 
@@ -974,6 +1002,8 @@ const GREP_DEFAULT_EXCLUSIONS = [
 const GREP_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const GREP_MAX_RESULTS_CEILING = 1000;
 const GREP_DEFAULT_MAX_RESULTS = 100;
+const GREP_TIMEOUT_MS = 30000; // native fallback deadline; mirrors rg's exec timeout
+const GREP_MAX_REPORTED_ERRORS = 10; // cap on error entries returned to the caller
 
 export interface GrepOptions {
   excludePatterns?: string[];
@@ -996,6 +1026,15 @@ export interface GrepResult {
   matches: GrepMatch[];
   truncated: boolean;
   totalMatches: number;
+  /**
+   * Files within the search scope that were NOT searched (binary, oversized,
+   * or unreadable). Intentionally excluded/ignored files are NOT counted.
+   * Always 0 for the ripgrep engine (rg manages skipping internally; its
+   * stderr warnings are surfaced via `errors` instead).
+   */
+  skippedFiles: number;
+  /** Non-fatal problems encountered during the search (capped at GREP_MAX_REPORTED_ERRORS). */
+  errors: string[];
 }
 
 /**
@@ -1039,6 +1078,21 @@ export function formatGrepResult(result: GrepResult, includeSnippet: boolean = t
           lines.push(`${match.path}:${ctxLineNum}`);
         }
       }
+    }
+  }
+
+  if (result.skippedFiles > 0) {
+    lines.push(
+      `# note: ${result.skippedFiles} file(s) in scope were not searched (binary, oversized, or unreadable)`
+    );
+  }
+
+  if (result.errors.length > 0) {
+    for (const err of result.errors.slice(0, GREP_MAX_REPORTED_ERRORS)) {
+      lines.push(`# error: ${err}`);
+    }
+    if (result.errors.length > GREP_MAX_REPORTED_ERRORS) {
+      lines.push(`# ... ${result.errors.length - GREP_MAX_REPORTED_ERRORS} more error(s) suppressed`);
     }
   }
 
@@ -1114,6 +1168,20 @@ export async function grepFilesWithValidation(
     });
   }
 
+  // Single-file root: the directory walker below uses fs.readdir, which fails
+  // silently (ENOTDIR → caught → zero results) when given a file path.
+  // Search the file directly instead. (ripgrep handles file roots natively.)
+  const rootStats = await fs.stat(validRootPath).catch(() => null);
+  if (rootStats?.isFile()) {
+    return grepSingleFile(validRootPath, pattern, {
+      excludePatterns,
+      includeIgnored,
+      contextLines,
+      maxResults: cappedMax,
+      filePattern,
+    });
+  }
+
   return grepWithNativeFallback(validRootPath, pattern, allowedDirectories, {
     excludePatterns,
     includeIgnored,
@@ -1179,16 +1247,25 @@ async function grepWithRipgrep(
   args.push('--', pattern, rootPath);
 
   try {
-    const { stdout } = await execFileAsync('rg', args, {
+    const { stdout, stderr } = await execFileAsync('rg', args, {
       maxBuffer: 50 * 1024 * 1024, // 50MB buffer
-      timeout: 30000,
+      timeout: GREP_TIMEOUT_MS,
     });
 
-    return parseRipgrepOutput(stdout, maxResults, contextLines > 0);
+    const result = parseRipgrepOutput(stdout, maxResults, contextLines > 0, contextLines);
+
+    // rg reports per-file problems (unreadable, binary, etc.) as stderr
+    // warnings — surface them instead of swallowing, capped to avoid bloat.
+    const warnings = stderr.trim() ? stderr.trim().split('\n') : [];
+    if (warnings.length > 0) {
+      result.errors = warnings.slice(0, GREP_MAX_REPORTED_ERRORS);
+    }
+
+    return result;
   } catch (error: any) {
     // rg exit code 1 = no matches found
     if (error.code === 1) {
-      return { matches: [], truncated: false, totalMatches: 0 };
+      return { matches: [], truncated: false, totalMatches: 0, skippedFiles: 0, errors: [] };
     }
     // rg exit code 2 = error (bad regex, permission denied, etc.)
     if (error.code === 2) {
@@ -1207,7 +1284,12 @@ async function grepWithRipgrep(
  * Match lines:  path:lineno:content
  * Context lines: path:lineno-content
  */
-function parseRipgrepOutput(output: string, maxResults: number, hasContext: boolean): GrepResult {
+function parseRipgrepOutput(
+  output: string,
+  maxResults: number,
+  hasContext: boolean,
+  contextLines = 0
+): GrepResult {
   const matches: GrepMatch[] = [];
   const outputLines = output.split('\n');
 
@@ -1246,6 +1328,27 @@ function parseRipgrepOutput(output: string, maxResults: number, hasContext: bool
     }
   }
 
+  // Shared-context fidelity: with -C, a line that falls inside the context
+  // windows of two adjacent matches is printed once by rg (attached to the
+  // earlier match's contextAfter). Copy it into the later match's
+  // contextBefore so both windows are complete, mirroring rg's display.
+  if (hasContext && contextLines > 0) {
+    for (let i = 1; i < matches.length; i++) {
+      const prev = matches[i - 1];
+      const cur = matches[i];
+      if (prev.path !== cur.path) continue;
+      if (!prev.contextAfter || !cur.contextBefore) continue;
+      const windowStart = cur.line - contextLines;
+      const shared = prev.contextAfter.filter((_, idx) => {
+        const lineNum = prev.line + 1 + idx;
+        return lineNum >= windowStart && lineNum < cur.line;
+      });
+      if (shared.length > 0) {
+        cur.contextBefore = [...shared, ...cur.contextBefore];
+      }
+    }
+  }
+
   const truncated = matches.length > maxResults;
   const finalMatches = truncated ? matches.slice(0, maxResults) : matches;
 
@@ -1253,6 +1356,11 @@ function parseRipgrepOutput(output: string, maxResults: number, hasContext: bool
     matches: finalMatches,
     truncated,
     totalMatches: matches.length,
+    // rg handles binary/oversized/ignored-file skipping internally; per-file
+    // skip counts are not recoverable from stdout (stderr warnings are
+    // surfaced by the caller instead).
+    skippedFiles: 0,
+    errors: [],
   };
 }
 
@@ -1294,14 +1402,33 @@ async function grepWithNativeFallback(
   const matches: GrepMatch[] = [];
   let totalFound = 0;
   let truncated = false;
+  let skippedFiles = 0;
+  let timedOut = false;
+  const errors: string[] = [];
+  const deadline = Date.now() + GREP_TIMEOUT_MS;
 
   async function searchDir(currentPath: string): Promise<void> {
     if (truncated) return;
+
+    // Deadline: mirror ripgrep's exec timeout so both engines share the
+    // same time contract. Partial results are returned with truncated=true.
+    if (Date.now() > deadline) {
+      if (!timedOut) {
+        timedOut = true;
+        truncated = true;
+        errors.push(`search aborted: exceeded ${GREP_TIMEOUT_MS}ms time limit (results may be incomplete)`);
+      }
+      return;
+    }
 
     let entries;
     try {
       entries = await fs.readdir(currentPath, { withFileTypes: true });
     } catch {
+      // Directory unreadable (permissions): report instead of silently vanishing
+      if (errors.length < GREP_MAX_REPORTED_ERRORS) {
+        errors.push(`cannot read directory: ${currentPath}`);
+      }
       return;
     }
 
@@ -1328,6 +1455,11 @@ async function grepWithNativeFallback(
         continue;
       }
 
+      // NOTE — symlinks: Dirent reports the link itself, so isDirectory()/
+      // isFile() are false for symlinks and symlinked files/directories are
+      // silently skipped. This intentionally matches ripgrep's default
+      // (no --follow), keeping both engines consistent. Use rg manually
+      // with --follow if symlinked content must be searched.
       if (entry.isDirectory()) {
         await searchDir(fullPath);
       } else if (entry.isFile()) {
@@ -1342,15 +1474,26 @@ async function grepWithNativeFallback(
         // Check file size
         try {
           const stats = await fs.stat(fullPath);
-          if (stats.size > GREP_MAX_FILE_SIZE || stats.size === 0) continue;
+          if (stats.size > GREP_MAX_FILE_SIZE) {
+            skippedFiles++;
+            continue;
+          }
+          if (stats.size === 0) continue; // empty file: nothing to search, not an anomaly
         } catch {
+          skippedFiles++;
+          if (errors.length < GREP_MAX_REPORTED_ERRORS) errors.push(`cannot stat file: ${fullPath}`);
           continue;
         }
 
         // Check if binary
         try {
-          if (await isBinaryFile(fullPath)) continue;
+          if (await isBinaryFile(fullPath)) {
+            skippedFiles++;
+            continue;
+          }
         } catch {
+          skippedFiles++;
+          if (errors.length < GREP_MAX_REPORTED_ERRORS) errors.push(`cannot read file: ${fullPath}`);
           continue;
         }
 
@@ -1366,6 +1509,8 @@ async function grepWithNativeFallback(
             }
           }
         } catch {
+          skippedFiles++;
+          if (errors.length < GREP_MAX_REPORTED_ERRORS) errors.push(`cannot search file: ${fullPath}`);
           continue;
         }
       }
@@ -1378,6 +1523,8 @@ async function grepWithNativeFallback(
     matches,
     truncated,
     totalMatches: totalFound,
+    skippedFiles,
+    errors,
   };
 }
 
@@ -1419,4 +1566,89 @@ async function searchFileLines(
   }
 
   return results;
+}
+
+/**
+ * Search a single file's contents (root path points to a file, not a directory).
+ * The native fallback walks directories with fs.readdir, which throws ENOTDIR
+ * on a file root — previously swallowed by a silent catch, producing a false
+ * "No matches found". This dedicated path applies the same size, binary,
+ * exclusion, and filePattern checks as the directory walker, then searches.
+ */
+async function grepSingleFile(
+  filePath: string,
+  pattern: string,
+  options: {
+    excludePatterns: string[];
+    includeIgnored: boolean;
+    contextLines: number;
+    maxResults: number;
+    filePattern?: string;
+  }
+): Promise<GrepResult> {
+  const { excludePatterns, includeIgnored, contextLines, maxResults, filePattern } = options;
+
+  // Smart-case: case-insensitive when pattern has no uppercase letters
+  const hasUppercase = /[A-Z]/.test(pattern);
+  let regex: RegExp;
+  try {
+    regex = new RegExp(pattern, hasUppercase ? '' : 'i');
+  } catch (e) {
+    throw new Error(
+      `Invalid search pattern: ${pattern}. ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+
+  const emptyResult = (skippedFiles = 0, errors: string[] = []): GrepResult => ({
+    matches: [],
+    truncated: false,
+    totalMatches: 0,
+    skippedFiles,
+    errors,
+  });
+
+  const fileName = path.basename(filePath);
+  const allExclusions = includeIgnored
+    ? [...excludePatterns]
+    : [...GREP_DEFAULT_EXCLUSIONS, ...excludePatterns];
+
+  if (allExclusions.some(excl => minimatch(fileName, excl, { dot: true }))) {
+    return emptyResult();
+  }
+
+  if (filePattern && !minimatch(fileName, filePattern, { dot: true })) {
+    return emptyResult();
+  }
+
+  let stats;
+  try {
+    stats = await fs.stat(filePath);
+  } catch {
+    // stat failure on an explicitly-named file is exceptional — surface it
+    throw new Error(`cannot stat file: ${filePath}`);
+  }
+  if (stats.size > GREP_MAX_FILE_SIZE) {
+    return emptyResult(1, [`file exceeds ${GREP_MAX_FILE_SIZE} byte limit — not searched`]);
+  }
+  if (stats.size === 0) {
+    return emptyResult();
+  }
+
+  try {
+    if (await isBinaryFile(filePath)) {
+      return emptyResult(1, ['file appears to be binary — not searched']);
+    }
+  } catch {
+    return emptyResult(1, [`cannot read file: ${filePath}`]);
+  }
+
+  const matches = await searchFileLines(filePath, regex, contextLines);
+
+  return {
+    matches: matches.slice(0, maxResults),
+    truncated: matches.length > maxResults,
+    totalMatches: matches.length,
+    skippedFiles: 0,
+    errors: [],
+  };
 }

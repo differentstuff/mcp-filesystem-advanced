@@ -16,15 +16,18 @@ import {
   writeFileContent,
   // Search & filtering functions
   searchFilesWithValidation,
+  grepFilesWithValidation,
   // File editing functions
   applyFileEdits,
   tailFile,
   headFile
 } from '../lib.js';
 
-// Mock fs module
+// Mock fs and child_process modules (child_process mocked to force the native grep fallback deterministically)
 vi.mock('fs/promises');
+vi.mock('child_process');
 const mockFs = fs as any;
+const mockCp = (await import('child_process')).execFile as any;
 
 describe('Lib Functions', () => {
   beforeEach(() => {
@@ -498,9 +501,10 @@ describe('Lib Functions', () => {
         const edits = [
           { oldText: 'nonexistent line', newText: 'replacement' }
         ];
-        
+
+        // Updated to match current error contract: EDIT_FAILED with line-number hint
         await expect(applyFileEdits('/test/file.txt', edits, false))
-          .rejects.toThrow('Could not find exact match for edit');
+          .rejects.toThrow('EDIT_FAILED');
       });
 
       it('handles complex multi-line edits with indentation', async () => {
@@ -720,6 +724,90 @@ describe('Lib Functions', () => {
         
         expect(mockFileHandle.close).toHaveBeenCalled();
       });
+    });
+  });
+
+  describe('grepFilesWithValidation', () => {
+    beforeEach(() => {
+      mockFs.realpath.mockImplementation(async (p: any) => p.toString());
+      // Force native fallback: simulate ripgrep not on PATH
+      mockCp.execFile.mockImplementation((_cmd: any, _args: any, cb: any) => {
+        cb(new Error('ripgrep not found'));
+      });
+    });
+
+    it('searches a single file when the path points to a file (regression: silent ENOTDIR false negative)', async () => {
+      const content = 'const a = 1;\nconst shimValues = { x: 1 };\nconst b = 2;\n';
+      mockFs.stat.mockResolvedValue({
+        size: content.length,
+        isDirectory: () => false,
+        isFile: () => true
+      } as any);
+
+      // Binary sniff (isBinaryFile reads first 8KB): return non-null bytes
+      const mockFileHandle = {
+        read: vi.fn().mockResolvedValue({ bytesRead: 2, buffer: Buffer.from('ok') }),
+        close: vi.fn().mockResolvedValue(undefined)
+      } as any;
+      mockFs.open.mockResolvedValue(mockFileHandle);
+
+      mockFs.readFile.mockResolvedValue(content);
+
+      const result = await grepFilesWithValidation(
+        process.platform === 'win32' ? 'C:\\allowed\\dir\\index.js' : '/allowed/dir/index.js',
+        'shimValues',
+        process.platform === 'win32' ? ['C:\\allowed'] : ['/allowed']
+      );
+
+      expect(result.matches).toHaveLength(1);
+      expect(result.matches[0].line).toBe(2);
+      expect(result.matches[0].snippet).toContain('shimValues');
+      expect(result.truncated).toBe(false);
+      expect(result.skippedFiles).toBe(0);
+      expect(result.errors).toEqual([]);
+    });
+
+    it('returns no matches for a zero-byte file root', async () => {
+      mockFs.stat.mockResolvedValue({
+        size: 0,
+        isDirectory: () => false,
+        isFile: () => true
+      } as any);
+
+      const result = await grepFilesWithValidation(
+        process.platform === 'win32' ? 'C:\\allowed\\dir\\empty.js' : '/allowed/dir/empty.js',
+        'anything',
+        process.platform === 'win32' ? ['C:\\allowed'] : ['/allowed']
+      );
+
+      expect(result.matches).toHaveLength(0);
+      expect(result.skippedFiles).toBe(0);
+    });
+
+    it('reports a binary file root as skipped with an explanatory error', async () => {
+      mockFs.stat.mockResolvedValue({
+        size: 100,
+        isDirectory: () => false,
+        isFile: () => true
+      } as any);
+
+      // Binary sniff (isBinaryFile reads first 8KB): buffer contains a null byte
+      const mockFileHandle = {
+        read: vi.fn().mockResolvedValue({ bytesRead: 4, buffer: Buffer.from('a\0bc') }),
+        close: vi.fn().mockResolvedValue(undefined)
+      } as any;
+      mockFs.open.mockResolvedValue(mockFileHandle);
+
+      const result = await grepFilesWithValidation(
+        process.platform === 'win32' ? 'C:\\allowed\\dir\\blob.bin' : '/allowed/dir/blob.bin',
+        'anything',
+        process.platform === 'win32' ? ['C:\\allowed'] : ['/allowed']
+      );
+
+      expect(result.matches).toHaveLength(0);
+      expect(result.skippedFiles).toBe(1);
+      expect(result.errors.length).toBeGreaterThan(0);
+      expect(result.errors[0]).toContain('binary');
     });
   });
 });

@@ -101,7 +101,9 @@ setAllowedDirectories(allowedDirectories);
 const ReadTextFileArgsSchema = z.object({
   path: z.string(),
   tail: z.number().optional().describe('If provided, returns only the last N lines of the file'),
-  head: z.number().optional().describe('If provided, returns only the first N lines of the file')
+  head: z.number().optional().describe('If provided, returns only the first N lines of the file'),
+  offset: z.number().int().min(0).optional().default(0)
+    .describe('0-based line offset: skip the first N lines before returning (applied after head/tail selection). Combine with head to page through a file: offset=100, head=50 returns lines 101-150.')
 });
 
 const ReadMediaFileArgsSchema = z.object({
@@ -188,7 +190,7 @@ const GetFileInfoArgsSchema = z.object({
 // Server setup
 const server = new FastMCP({
   name: "secure-filesystem-server",
-  version: "0.2.0",
+  version: "1.2.0",
 });
 
 // Reads a file as a stream of buffers, concatenates them, and then encodes
@@ -226,6 +228,16 @@ const readTextFileHandler = async (args: z.infer<typeof ReadTextFileArgsSchema>)
     content = await headFile(validPath, args.head);
   } else {
     content = await readFileContent(validPath);
+  }
+
+  // Line offset: skip the first N lines (applied after head/tail selection)
+  if (args.offset && args.offset > 0) {
+    const lines = content.split('\n');
+    if (args.offset >= lines.length) {
+      content = '';
+    } else {
+      content = lines.slice(args.offset).join('\n');
+    }
   }
 
   return content;

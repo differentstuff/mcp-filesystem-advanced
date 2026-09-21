@@ -190,7 +190,7 @@ For any MCP-compatible client:
 
 | Tool | Description |
 |------|-------------|
-| `read_text_file` | Read file contents (with optional head/tail) |
+| `read_text_file` | Read file contents (with optional head/tail, plus `offset` to skip the first N lines for paging) |
 | `read_media_file` | Read image/audio files as base64 |
 | `read_multiple_files` | Read multiple files at once |
 | `write_file` | Write file (auto-creates parent dirs) |
@@ -217,6 +217,15 @@ For any MCP-compatible client:
 | Get an overview of project structure | `directory_tree` | Recursive tree view |
 
 **Key distinction:** `search_files` matches file/directory **names** (glob on paths). `grep_files` opens files and matches **content** (regex on text).
+
+### grep_files Behavior Notes
+
+- **Single-file paths work**: `path` may point to a file or a directory. (Earlier versions silently returned "No matches found" for file paths when ripgrep was unavailable — the native fallback used `fs.readdir`, which fails with `ENOTDIR` on files. Fixed in 1.1.1.)
+- **Two engines**: ripgrep (`rg`) is used when available on PATH and an in-process walker is the fallback otherwise. Install `ripgrep` for significantly faster searches on large trees (the mcp-proxy Dockerfile includes it).
+- **Timeout**: both engines share a 30s time limit. On timeout, partial results are returned with `truncated: true` and an explanatory `errors` entry.
+- **Symlinks are not followed**: symlinked files/directories are silently skipped. This intentionally matches ripgrep's default (no `--follow`), so both engines cover the same scope. Use `rg --follow` manually if symlinked content must be searched.
+- **Skipped files are reported**: files in scope but not searched (binary, >10MB, unreadable) are counted in `skippedFiles` and surfaced as `# note:` / `# error:` lines in the output. An empty result is therefore always distinguishable from an incomplete search.
+- **Default exclusions**: `node_modules`, `.git`, lock files, build outputs, etc. are always skipped unless `includeIgnored: true`; user `excludePatterns` / `filePattern` apply on top.
 
 ## Enhanced Behavior
 
