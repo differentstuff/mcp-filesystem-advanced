@@ -16,7 +16,6 @@ import {
   readFileContent,
   writeFileContent,
   searchFilesWithValidation,
-  applyFileEdits,
   tailFile,
   headFile,
   setAllowedDirectories,
@@ -32,6 +31,7 @@ import {
   grepFilesWithValidation,
   formatGrepResult,
 } from './lib.js';
+import { enqueueEdits } from './edit-queue.js';
 
 // Command line argument parsing
 const args = process.argv.slice(2);
@@ -123,7 +123,7 @@ const WriteFileArgsSchema = z.object({
 });
 
 const EditOperation = z.object({
-  oldText: z.string().describe('Text to search for - must match exactly'),
+  oldText: z.string().describe('Text to search for - must match exactly and uniquely; ambiguous matches are rejected'),
   newText: z.string().describe('Text to replace with')
 });
 
@@ -373,20 +373,25 @@ server.addTool({
   name: "edit_file",
   description:
     "Make line-based edits to a text file. Each edit replaces exact line sequences " +
-    "with new content. Returns a git-style diff showing the changes made. " +
-    "On failure, returns EDIT_FAILED with a line-number hint — read the file at that location and retry with the correct oldText. " +
+    "with new content. Multiple edits in one call are applied as a single transaction " +
+    "(edit 2 may reference text produced by edit 1). Concurrent edit_file calls to the " +
+    "same file are automatically serialized and merged by the server: edits to disjoint " +
+    "regions all succeed and are stored in one atomic write, while overlapping concurrent " +
+    "edits are rejected with EDIT_CONFLICT naming both spans. Returns a git-style diff " +
+    "showing the changes made. On failure, returns EDIT_FAILED with a line-number hint — " +
+    "read the file at that location and retry with the correct oldText. " +
     "Only works within allowed directories.",
   parameters: z.object({
     path: z.string(),
     edits: z.array(z.object({
-      oldText: z.string().describe("Text to search for - must match exactly"),
+      oldText: z.string().describe("Text to search for - must match exactly and uniquely; ambiguous matches are rejected"),
       newText: z.string().describe("Text to replace with")
     })),
     dryRun: z.boolean().default(false).describe("Preview changes using git-style diff format")
   }),
   execute: async (args: z.infer<typeof EditFileArgsSchema>) => {
     const validPath = await validatePath(args.path);
-    return await applyFileEdits(validPath, args.edits, args.dryRun);
+    return await enqueueEdits(validPath, args.edits, args.dryRun);
   },
   annotations: { readOnlyHint: false, idempotentHint: false, destructiveHint: true }
 });

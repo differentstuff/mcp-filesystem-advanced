@@ -20,6 +20,7 @@ import {
   grepFilesWithValidation,
   // File editing functions
   applyFileEdits,
+  locateEdit,
   tailFile,
   headFile
 } from '../lib.js';
@@ -573,15 +574,15 @@ describe('Lib Functions', () => {
 
       it('handles CRLF line endings in file content', async () => {
         mockFs.readFile.mockResolvedValue('line1\r\nline2\r\nline3\r\n');
-        
+
         const edits = [
           { oldText: 'line2', newText: 'modified line2' }
         ];
-        
+
         mockFs.rename.mockResolvedValueOnce(undefined);
-        
+
         await applyFileEdits('/test/file.txt', edits, false);
-        
+
         expect(mockFs.writeFile).toHaveBeenCalledWith(
           expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
           'line1\nmodified line2\nline3\n',
@@ -591,6 +592,88 @@ describe('Lib Functions', () => {
           expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
           '/test/file.txt'
         );
+      });
+
+      it('fails with EDIT_FAILED ambiguous for multi-occurrence oldText instead of replacing the first', async () => {
+        mockFs.readFile.mockResolvedValue('dup\nX\ndup\nY\n');
+        mockFs.writeFile.mockResolvedValue(undefined);
+
+        await expect(applyFileEdits('/test/file.txt', [{ oldText: 'dup', newText: 'Z' }], false))
+          .rejects.toThrow(/EDIT_FAILED[\s\S]*ambiguous[\s\S]*2 locations[\s\S]*match_lines: 1, 3/);
+        expect(mockFs.writeFile).not.toHaveBeenCalled();
+      });
+
+      it('resolves ambiguous oldText via context expansion when one candidate has unique context', async () => {
+        // 'Q' occurs four times: three inside the repeated 'K Q' block (their
+        // ±context repeats too), one with unique context (M Q N). Context
+        // expansion resolves to line 9.
+        mockFs.readFile.mockResolvedValue('K\nQ\nK\nQ\nK\nQ\nK\nM\nQ\nN\n');
+        mockFs.writeFile.mockResolvedValue(undefined);
+        mockFs.rename.mockResolvedValue(undefined);
+
+        await applyFileEdits('/test/file.txt', [{ oldText: 'Q', newText: 'QX' }], false);
+
+        expect(mockFs.writeFile).toHaveBeenCalledWith(
+          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          'K\nQ\nK\nQ\nK\nQ\nK\nM\nQX\nN\n',
+          'utf-8'
+        );
+      });
+
+      it('handles chained edits where edit 2 references edit 1 output', async () => {
+        mockFs.readFile.mockResolvedValue('A1\nA2\nA3\n');
+        mockFs.writeFile.mockResolvedValue(undefined);
+        mockFs.rename.mockResolvedValue(undefined);
+
+        await applyFileEdits('/test/file.txt', [
+          { oldText: 'A1', newText: 'A1-beta' },
+          { oldText: 'A1-beta', newText: 'A1-gamma' }
+        ], false);
+
+        expect(mockFs.writeFile).toHaveBeenCalledWith(
+          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+          'A1-gamma\nA2\nA3\n',
+          'utf-8'
+        );
+      });
+    });
+
+    describe('locateEdit', () => {
+      it('locates a unique exact match and returns its char span', () => {
+        const content = 'A1\nA2\nA3\n';
+        const loc = locateEdit(content, 'A2', 'B2');
+        expect(loc).not.toBeNull();
+        expect(loc!.occurrences).toBe(1);
+        expect(loc!.start).toBe(3);
+        expect(loc!.end).toBe(5);
+        expect(loc!.replacement).toBe('B2');
+        expect(loc!.matchLines).toEqual([2]);
+      });
+
+      it('returns null when oldText cannot be located', () => {
+        expect(locateEdit('A1\nA2\n', 'missing', 'x')).toBeNull();
+      });
+
+      it('returns null for empty oldText', () => {
+        expect(locateEdit('A1\nA2\n', '', 'x')).toBeNull();
+      });
+
+      it('reports ambiguity with occurrence count and 1-based match lines', () => {
+        const content = 'dup\nX\ndup\nY\n';
+        const loc = locateEdit(content, 'dup', 'Z');
+        expect(loc).not.toBeNull();
+        expect(loc!.occurrences).toBe(2);
+        expect(loc!.matchLines).toEqual([1, 3]);
+      });
+
+      it('resolves ambiguous matches via context expansion when one candidate has unique context', () => {
+        const content = 'K\nQ\nK\nQ\nK\nQ\nK\nM\nQ\nN\n';
+        const loc = locateEdit(content, 'Q', 'QX');
+        expect(loc).not.toBeNull();
+        expect(loc!.occurrences).toBe(1);
+        expect(loc!.matchLines).toEqual([9]);
+        expect(loc!.start).toBe(16);
+        expect(loc!.replacement).toBe('QX');
       });
     });
 

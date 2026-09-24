@@ -272,6 +272,22 @@ export async function withSubstrateLock<T>(
   }
 }
 
+/**
+ * Try to acquire a substrate without executing an operation.
+ * Used by the edit batch queue, which must hold the 'write' substrate across
+ * a whole batch window rather than around a single awaited operation.
+ */
+export function tryAcquireSubstrate(filePath: string, type: OperationType): AcquireResult {
+  return substrateTracker.tryAcquire(filePath, type);
+}
+
+/**
+ * Release a substrate previously acquired via tryAcquireSubstrate.
+ */
+export function releaseSubstrate(operation: OperationInfo): void {
+  substrateTracker.release(operation);
+}
+
 // Function to set allowed directories from the main module
 export function setAllowedDirectories(directories: string[]): void {
   allowedDirectories = [...directories];
@@ -698,7 +714,7 @@ export async function writeFileContent(filePath: string, content: string): Promi
 
 
 // File Editing Functions
-interface FileEdit {
+export interface FileEdit {
   oldText: string;
   newText: string;
 }
@@ -729,6 +745,320 @@ function generateEditHint(fileContent: string, oldText: string): string {
   return `no close match found for: "${searchKey.substring(0, 60)}"`;
 }
 
+/**
+ * Result of locating an edit within file content.
+ */
+export interface EditLocation {
+  /** Char offset of the matched region (inclusive). */
+  start: number;
+  /** Char offset one past the end of the matched region (exclusive). */
+  end: number;
+  /**
+   * Number of candidate matches found. 1 means the match is unique and
+   * start/end/replacement are usable. A value > 1 means the match is
+   * ambiguous: start/end/replacement then refer to the FIRST candidate only
+   * and must not be used — read matchLines for the error message instead.
+   */
+  occurrences: number;
+  /** 1-based line numbers of every candidate match (for error messages). */
+  matchLines: number[];
+  /** Exact text to splice in place of content.slice(start, end). */
+  replacement: string;
+}
+
+/**
+ * Finds all occurrences of a substring (including overlapping ones) and
+ * returns their start offsets. Overlap-aware counting matters for
+ * disambiguation: a candidate inside a repeated block must see its expanded
+ * context counted at every repeat, even when repeats share characters.
+ */
+function findSubstringOffsets(content: string, needle: string): number[] {
+  const offsets: number[] = [];
+  let idx = content.indexOf(needle);
+  while (idx !== -1) {
+    offsets.push(idx);
+    idx = content.indexOf(needle, idx + 1);
+  }
+  return offsets;
+}
+
+/** Char offset of the start of line `lineIndex` (0-based) in the line-split content. */
+function lineStartOffset(contentLines: string[], lineIndex: number): number {
+  let offset = 0;
+  for (let i = 0; i < lineIndex; i++) {
+    offset += contentLines[i].length + 1; // +1 for the newline separator
+  }
+  return offset;
+}
+
+/** 1-based line number containing the char offset `charOffset`. */
+function lineNumberAt(content: string, charOffset: number): number {
+  let line = 1;
+  for (let i = 0; i < charOffset && i < content.length; i++) {
+    if (content[i] === '\n') line++;
+  }
+  return line;
+}
+
+interface FlexibleMatch {
+  start: number;
+  end: number;
+  /** 0-based index of the first matched line. */
+  startLine: number;
+  replacement: string;
+}
+
+/**
+ * Whitespace-flexible whole-line scan: matches oldText against consecutive
+ * content lines with trimmed comparison. Counts ALL matches, not just the
+ * first, and builds an indentation-preserving replacement for each.
+ */
+function findFlexibleMatches(content: string, oldText: string, newText: string): FlexibleMatch[] {
+  const oldLines = oldText.split('\n');
+  const contentLines = content.split('\n');
+  const matches: FlexibleMatch[] = [];
+
+  for (let i = 0; i <= contentLines.length - oldLines.length; i++) {
+    const isMatch = oldLines.every((oldLine, j) =>
+      contentLines[i + j].trim() === oldLine.trim()
+    );
+    if (!isMatch) continue;
+
+    const start = lineStartOffset(contentLines, i);
+    const endLineIndex = i + oldLines.length;
+    const end = endLineIndex < contentLines.length
+      ? lineStartOffset(contentLines, endLineIndex)
+      : content.length;
+
+    // Preserve original indentation of first line; adjust relative indentation
+    const originalIndent = contentLines[i].match(/^\s*/)?.[0] || '';
+    const newLines = newText.split('\n').map((line, j) => {
+      if (j === 0) return originalIndent + line.trimStart();
+      const oldIndent = oldLines[j]?.match(/^\s*/)?.[0] || '';
+      const newIndent = line.match(/^\s*/)?.[0] || '';
+      if (oldIndent && newIndent) {
+        const relativeIndent = newIndent.length - oldIndent.length;
+        return originalIndent + ' '.repeat(Math.max(0, relativeIndent)) + line.trimStart();
+      }
+      return line;
+    });
+
+    matches.push({ start, end, startLine: i, replacement: newLines.join('\n') });
+  }
+
+  return matches;
+}
+
+/** Maximum number of context lines added on each side for disambiguation. */
+const EDIT_CONTEXT_EXPANSION_MAX_LINES = 3;
+
+/**
+ * Attempts git-apply-style context disambiguation when a match is ambiguous:
+ * each candidate region is expanded by 1..3 context lines on each side and
+ * re-tested for uniqueness within the content. If exactly one candidate's
+ * expanded region is unique, that candidate is the intended match — the other
+ * occurrences sit inside repeated blocks and cannot be the identifiable one.
+ * Returns the index of the resolved candidate, or -1 if still ambiguous.
+ */
+function resolveByContextExpansion(
+  content: string,
+  candidates: { start: number; end: number }[]
+): number {
+  const contentLines = content.split('\n');
+  for (let width = 1; width <= EDIT_CONTEXT_EXPANSION_MAX_LINES; width++) {
+    let resolved = -1;
+    let resolvedCount = 0;
+    for (let c = 0; c < candidates.length; c++) {
+      const startLineIdx = Math.max(0, lineNumberAt(content, candidates[c].start) - 1 - width);
+      const lastLineIdx = Math.max(
+        startLineIdx,
+        lineNumberAt(content, Math.max(candidates[c].end - 1, candidates[c].start)) - 1
+      );
+      const endLineIdx = Math.min(contentLines.length, lastLineIdx + 1 + width);
+      const text = contentLines.slice(startLineIdx, endLineIdx).join('\n');
+      if (text.length > 0 && findSubstringOffsets(content, text).length === 1) {
+        resolved = c;
+        resolvedCount++;
+      }
+    }
+    if (resolvedCount === 1) return resolved;
+  }
+  return -1;
+}
+
+/**
+ * Locates oldText within content for a single edit.
+ *
+ * Match strategy (in order):
+ * 1. Exact substring match. If unique, the matched char span is returned with
+ *    replacement = newText.
+ * 2. If there are multiple exact candidates, git-apply-style context
+ *    expansion disambiguates; if that fails the edit is ambiguous.
+ * 3. If there is no exact match, a whitespace-flexible whole-line scan is
+ *    used (all matches counted, indentation-preserving replacement), with the
+ *    same context-expansion disambiguation for multiple candidates.
+ *
+ * Returns null if oldText is empty or cannot be located. If the returned
+ * location has occurrences > 1 the edit is ambiguous: start/end/replacement
+ * point at the first candidate only and must not be used.
+ */
+export function locateEdit(
+  content: string,
+  oldText: string,
+  newText: string = ''
+): EditLocation | null {
+  if (oldText.length === 0) return null;
+
+  const exactOffsets = findSubstringOffsets(content, oldText);
+  if (exactOffsets.length === 1) {
+    const start = exactOffsets[0];
+    return {
+      start,
+      end: start + oldText.length,
+      occurrences: 1,
+      matchLines: [lineNumberAt(content, start)],
+      replacement: newText,
+    };
+  }
+
+  if (exactOffsets.length > 1) {
+    const candidates = exactOffsets.map(off => ({ start: off, end: off + oldText.length }));
+    const resolved = resolveByContextExpansion(content, candidates);
+    if (resolved !== -1) {
+      const candidate = candidates[resolved];
+      return {
+        start: candidate.start,
+        end: candidate.end,
+        occurrences: 1,
+        matchLines: [lineNumberAt(content, candidate.start)],
+        replacement: newText,
+      };
+    }
+    return {
+      start: candidates[0].start,
+      end: candidates[0].end,
+      occurrences: candidates.length,
+      matchLines: candidates.map(c => lineNumberAt(content, c.start)),
+      replacement: newText,
+    };
+  }
+
+  // No exact match — whitespace-flexible whole-line scan
+  const flexible = findFlexibleMatches(content, oldText, newText);
+  if (flexible.length === 0) return null;
+  if (flexible.length === 1) {
+    const match = flexible[0];
+    return {
+      start: match.start,
+      end: match.end,
+      occurrences: 1,
+      matchLines: [match.startLine + 1],
+      replacement: match.replacement,
+    };
+  }
+  const candidates = flexible.map(m => ({ start: m.start, end: m.end }));
+  const resolved = resolveByContextExpansion(content, candidates);
+  if (resolved !== -1) {
+    const match = flexible[resolved];
+    return {
+      start: match.start,
+      end: match.end,
+      occurrences: 1,
+      matchLines: [match.startLine + 1],
+      replacement: match.replacement,
+    };
+  }
+  return {
+    start: flexible[0].start,
+    end: flexible[0].end,
+    occurrences: flexible.length,
+    matchLines: flexible.map(m => m.startLine + 1),
+    replacement: flexible[0].replacement,
+  };
+}
+
+/**
+ * Options for applyEditsToContent.
+ */
+export interface ApplyEditsOptions {
+  /**
+   * Additional hint included when an edit's oldText cannot be found — used by
+   * the concurrent-edit batch queue to signal a dependency on another call.
+   */
+  dependencyHint?: string;
+}
+
+/**
+ * Applies edits sequentially to in-memory content and returns the modified
+ * content. Throws structured EDIT_FAILED errors; nothing is written here.
+ *
+ * Edits chain within the call: edit 2 may reference text produced by edit 1.
+ * Multi-occurrence oldText is rejected as ambiguous instead of silently
+ * replacing the first occurrence.
+ */
+export function applyEditsToContent(
+  content: string,
+  edits: FileEdit[],
+  filePath: string,
+  options: ApplyEditsOptions = {}
+): string {
+  let modifiedContent = content;
+  for (const edit of edits) {
+    const normalizedOld = normalizeLineEndings(edit.oldText);
+    const normalizedNew = normalizeLineEndings(edit.newText);
+
+    const location = locateEdit(modifiedContent, normalizedOld, normalizedNew);
+
+    if (location === null) {
+      const hint = generateEditHint(content, normalizedOld);
+      throw new Error(
+        `EDIT_FAILED\n` +
+        `  file: ${filePath}\n` +
+        `  reason: oldText not found in file (exact match and whitespace-flexible match both failed)\n` +
+        `  hint: ${hint}\n` +
+        (options.dependencyHint ? `  note: ${options.dependencyHint}\n` : '') +
+        `  next_step: Read the file at the hinted location, then retry the edit with the correct oldText\n` +
+        `  no changes were written`
+      );
+    }
+
+    if (location.occurrences > 1) {
+      throw new Error(
+        `EDIT_FAILED\n` +
+        `  file: ${filePath}\n` +
+        `  reason: ambiguous — oldText matches ${location.occurrences} locations (exact and context-expanded matching could not disambiguate)\n` +
+        `  match_lines: ${location.matchLines.join(', ')} (1-based)\n` +
+        `  next_step: Include more surrounding lines in oldText so the match is unique, then retry\n` +
+        `  no changes were written`
+      );
+    }
+
+    modifiedContent =
+      modifiedContent.slice(0, location.start) +
+      location.replacement +
+      modifiedContent.slice(location.end);
+  }
+  return modifiedContent;
+}
+
+/**
+ * Formats the unified diff of an edit as the tool result body, choosing a
+ * backtick fence that does not clash with the diff content.
+ */
+export function formatEditDiff(
+  originalContent: string,
+  modifiedContent: string,
+  filePath: string
+): string {
+  const diff = createUnifiedDiff(originalContent, modifiedContent, filePath);
+
+  let numBackticks = 3;
+  while (diff.includes('`'.repeat(numBackticks))) {
+    numBackticks++;
+  }
+  return `${'`'.repeat(numBackticks)}diff\n${diff}${'`'.repeat(numBackticks)}\n\n`;
+}
+
 export async function applyFileEdits(
   filePath: string,
   edits: FileEdit[],
@@ -737,76 +1067,11 @@ export async function applyFileEdits(
   // Read file content and normalize line endings
   const content = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
 
-  // Apply edits sequentially
-  let modifiedContent = content;
-  for (const edit of edits) {
-    const normalizedOld = normalizeLineEndings(edit.oldText);
-    const normalizedNew = normalizeLineEndings(edit.newText);
-
-    // If exact match exists, use it
-    if (modifiedContent.includes(normalizedOld)) {
-      modifiedContent = modifiedContent.replace(normalizedOld, normalizedNew);
-      continue;
-    }
-
-    // Otherwise, try line-by-line matching with flexibility for whitespace
-    const oldLines = normalizedOld.split('\n');
-    const contentLines = modifiedContent.split('\n');
-    let matchFound = false;
-
-    for (let i = 0; i <= contentLines.length - oldLines.length; i++) {
-      const potentialMatch = contentLines.slice(i, i + oldLines.length);
-
-      // Compare lines with normalized whitespace
-      const isMatch = oldLines.every((oldLine, j) => {
-        const contentLine = potentialMatch[j];
-        return oldLine.trim() === contentLine.trim();
-      });
-
-      if (isMatch) {
-        // Preserve original indentation of first line
-        const originalIndent = contentLines[i].match(/^\s*/)?.[0] || '';
-        const newLines = normalizedNew.split('\n').map((line, j) => {
-          if (j === 0) return originalIndent + line.trimStart();
-          // For subsequent lines, try to preserve relative indentation
-          const oldIndent = oldLines[j]?.match(/^\s*/)?.[0] || '';
-          const newIndent = line.match(/^\s*/)?.[0] || '';
-          if (oldIndent && newIndent) {
-            const relativeIndent = newIndent.length - oldIndent.length;
-            return originalIndent + ' '.repeat(Math.max(0, relativeIndent)) + line.trimStart();
-          }
-          return line;
-        });
-
-        contentLines.splice(i, oldLines.length, ...newLines);
-        modifiedContent = contentLines.join('\n');
-        matchFound = true;
-        break;
-      }
-    }
-
-    if (!matchFound) {
-      const hint = generateEditHint(content, normalizedOld);
-      throw new Error(
-        `EDIT_FAILED\n` +
-        `  file: ${filePath}\n` +
-        `  reason: oldText not found in file (exact match and whitespace-flexible match both failed)\n` +
-        `  hint: ${hint}\n` +
-        `  next_step: Read the file at the hinted location, then retry the edit with the correct oldText\n` +
-        `  no changes were written`
-      );
-    }
-  }
+  // Apply edits sequentially (throws structured EDIT_FAILED on failure)
+  const modifiedContent = applyEditsToContent(content, edits, filePath);
 
   // Create unified diff
-  const diff = createUnifiedDiff(content, modifiedContent, filePath);
-
-  // Format diff with appropriate number of backticks
-  let numBackticks = 3;
-  while (diff.includes('`'.repeat(numBackticks))) {
-    numBackticks++;
-  }
-  const formattedDiff = `${'`'.repeat(numBackticks)}diff\n${diff}${'`'.repeat(numBackticks)}\n\n`;
+  const formattedDiff = formatEditDiff(content, modifiedContent, filePath);
 
   if (!dryRun) {
     // Security: Use atomic rename to prevent race conditions where symlinks
