@@ -1,6 +1,6 @@
 # MCP Filesystem Advanced
 
-An enhanced Model Context Protocol (MCP) server for filesystem access with **Reaktionsnetzwerk-inspired operation tracking**, automatic parent directory creation, and intelligent conflict detection.
+An enhanced Model Context Protocol (MCP) server for filesystem access with operation tracking, automatic parent directory creation, atomic batched edits, and intelligent conflict detection.
 
 ## Features
 
@@ -190,11 +190,11 @@ For any MCP-compatible client:
 
 | Tool | Description |
 |------|-------------|
-| `read_text_file` | Read file contents (with optional head/tail, plus `offset` to skip the first N lines for paging) |
+| `read_text_file` | Read file contents (with optional head/tail, plus `offset` applied BEFORE head/tail for paging: offset=100, head=50 returns lines 101-150) |
 | `read_media_file` | Read image/audio files as base64 |
 | `read_multiple_files` | Read multiple files at once |
 | `write_file` | Write file (auto-creates parent dirs) |
-| `edit_file` | Make line-based edits to a file |
+| `edit_file` | Make line-based edits to a file (original-anchored batch matching, atomic all-or-nothing) |
 | `create_directory` | Create directory (auto-creates parents) |
 | `ensure_directory` | Explicitly ensure directory exists |
 | `list_directory` | List directory contents |
@@ -203,7 +203,7 @@ For any MCP-compatible client:
 | `move_file` | Move/rename files or directories |
 | `search_files` | Search file/directory **names** by glob pattern |
 | `grep_files` | Search file **contents** for a pattern |
-| `get_file_info` | Get file metadata |
+| `get_file_info` | Get file metadata (includes `lineCount` for files) |
 | `list_allowed_directories` | Show accessible directories |
 
 ### When to Use Which Search Tool
@@ -257,6 +257,27 @@ When multiple operations target overlapping paths:
 // Operation conflict: Path "/project/src" is currently being written 
 // (started 0s ago). Please wait and retry, or use a different path.
 ```
+
+### edit_file Batch Semantics
+
+`edit_file` applies a list of edits with **original-anchored matching** and
+**all-or-nothing** semantics:
+
+- Every edit is matched against the file content **as read at the start of the
+  call** — the way LLMs write edit lists. An edit whose `oldText` only exists
+  after an earlier edit in the same call (intentional chaining) is applied in
+  a second pass.
+- Two edits targeting overlapping regions of the original content are
+  rejected, naming both edit indexes.
+- The batch is atomic: either all edits apply in one write, or nothing is
+  written. Failure messages start with `EDIT FAILED — NOTHING WAS WRITTEN`
+  followed by a per-edit status (not found / ambiguous, with line hints).
+- Success results are prefixed with a one-line summary, e.g.
+  `3 edits applied (2 matched against original content, 1 applied after earlier edits)`,
+  followed by a git-style diff.
+- Concurrent `edit_file` calls to the same file are serialized and merged:
+  disjoint edits all succeed in one atomic write; overlapping concurrent
+  edits are rejected with `EDIT_CONFLICT` naming both spans.
 
 ## Development
 

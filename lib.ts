@@ -15,15 +15,11 @@ const execFileAsync = promisify(execFile);
 let allowedDirectories: string[] = [];
 
 // ============================================================================
-// Reaktionsnetzwerk-inspired Types and Interfaces
+// Types and Interfaces
 // ============================================================================
-// Each tool is like an enzyme: it has specific inputs (substrates),
-// produces specific outputs (products), and has activation conditions.
-// This design makes tools composable and their behavior predictable.
 
 /**
  * Result of a write operation with detailed feedback.
- * This follows the "enzyme" model: clear inputs, clear outputs.
  */
 export interface WriteResult {
   path: string;
@@ -59,14 +55,13 @@ export interface ParentStatus {
 }
 
 // ============================================================================
-// Substrate Tracking (Enzyme-Substrate Binding Model)
+// Operation Tracking
 // ============================================================================
-// In metabolic networks, enzymes bind to substrates temporarily.
-// When a substrate is already bound, other enzymes are "inhibited".
-// This tracker implements that concept for filesystem operations.
+// Per-path registry that serializes conflicting filesystem operations:
+// reads share a path, writes exclude everything else.
 
 /**
- * Types of operations that can lock a substrate (path).
+ * Types of operations that can hold a path lock.
  */
 export type OperationType = 'read' | 'write' | 'create' | 'move' | 'delete';
 
@@ -82,7 +77,7 @@ export interface OperationInfo {
 }
 
 /**
- * Result of trying to acquire a substrate.
+ * Result of trying to acquire a path lock.
  */
 export interface AcquireResult {
   success: boolean;
@@ -91,13 +86,10 @@ export interface AcquireResult {
 }
 
 /**
- * SubstrateTracker implements enzyme-substrate binding semantics.
- * 
- * Like in metabolic networks:
- * - Enzymes (tools) bind to substrates (paths) temporarily
- * - When substrate is bound, other modifying enzymes are inhibited
- * - Read operations can share substrates (like multiple enzymes reading same metabolite)
- * - Write operations are exclusive (like an enzyme transforming a metabolite)
+ * Tracks active operations per path.
+ *
+ * - Read operations can share a path
+ * - Write operations are exclusive
  */
 class SubstrateTracker {
   private activeOperations: Map<string, OperationInfo[]> = new Map();
@@ -147,7 +139,7 @@ class SubstrateTracker {
   }
 
   /**
-   * Try to acquire (bind to) a substrate.
+   * Try to acquire a path lock.
    * Returns success=true if acquired, or conflict info if blocked.
    */
   tryAcquire(filePath: string, type: OperationType): AcquireResult {
@@ -190,7 +182,7 @@ class SubstrateTracker {
   }
 
   /**
-   * Release a substrate after operation completes.
+   * Release a path lock after the operation completes.
    */
   release(operation: OperationInfo): void {
     const affectedPaths = this.getAffectedPaths(operation.path, operation.type);
@@ -242,12 +234,12 @@ class SubstrateTracker {
   }
 }
 
-// Global substrate tracker instance
+// Global operation tracker instance
 const substrateTracker = new SubstrateTracker();
 
 /**
- * Execute a filesystem operation with substrate tracking.
- * This wraps operations with automatic acquire/release semantics.
+ * Execute a filesystem operation with path-lock tracking.
+ * Wraps the operation with automatic acquire/release semantics.
  */
 export async function withSubstrateLock<T>(
   filePath: string,
@@ -273,8 +265,8 @@ export async function withSubstrateLock<T>(
 }
 
 /**
- * Try to acquire a substrate without executing an operation.
- * Used by the edit batch queue, which must hold the 'write' substrate across
+ * Try to acquire a path lock without executing an operation.
+ * Used by the edit batch queue, which must hold the 'write' lock across
  * a whole batch window rather than around a single awaited operation.
  */
 export function tryAcquireSubstrate(filePath: string, type: OperationType): AcquireResult {
@@ -282,7 +274,7 @@ export function tryAcquireSubstrate(filePath: string, type: OperationType): Acqu
 }
 
 /**
- * Release a substrate previously acquired via tryAcquireSubstrate.
+ * Release a path lock previously acquired via tryAcquireSubstrate.
  */
 export function releaseSubstrate(operation: OperationInfo): void {
   substrateTracker.release(operation);
@@ -299,15 +291,12 @@ export function getAllowedDirectories(): string[] {
 }
 
 // ============================================================================
-// Reaktionsnetzwerk-inspired Core Functions
+// Core Functions
 // ============================================================================
-// These functions implement the "enzyme" model: they have clear activation
-// conditions (substrates) and produce predictable outputs (products).
 
 /**
- * Checks the status of a path's parent directory.
- * This is a "sensor" function - it reads state without modifying it.
- * 
+ * Checks the status of a path's parent directory without modifying anything.
+ *
  * @param filePath - The file path to check
  * @returns Information about the parent directory status
  */
@@ -354,14 +343,7 @@ export async function checkParentStatus(filePath: string): Promise<ParentStatus>
 
 /**
  * Ensures the parent directory of a file exists, creating it if necessary.
- * This is a "synthase" function - it creates new structures.
- * 
- * Like an enzyme, it has:
- * - Activation condition: needs parent directory
- * - Substrate: file path
- * - Product: existing parent directory
- * - Byproduct: list of directories created
- * 
+ *
  * @param filePath - The file path whose parent should exist
  * @returns List of directories that were created (empty if already existed)
  */
@@ -412,8 +394,7 @@ export async function ensureParentDirectory(filePath: string): Promise<string[]>
 
 /**
  * Creates a directory recursively, returning detailed information about what was created.
- * This is a "synthase" function - it creates new structures.
- * 
+ *
  * @param dirPath - The directory path to create
  * @returns Information about what was created
  */
@@ -477,6 +458,8 @@ interface FileInfo {
   isDirectory: boolean;
   isFile: boolean;
   permissions: string;
+  /** Editor-convention line count (files only; absent for directories). */
+  lineCount?: number;
 }
 
 export interface SearchOptions {
@@ -547,13 +530,12 @@ function resolveRelativePathAgainstAllowedDirectories(relativePath: string): str
 
 /**
  * Validates a requested path and returns the validated absolute path.
- * 
- * This is a "sensor" function - it reads state and validates conditions.
- * Like an enzyme, it has activation conditions:
+ *
+ * Validation rules:
  * - Path must be within allowed directories
  * - For existing files, symlinks must resolve to allowed directories
  * - For new files, parent must exist (unless allowMissingParent is true)
- * 
+ *
  * @param requestedPath - The path to validate
  * @param options - Validation options
  * @returns The validated absolute path
@@ -637,9 +619,40 @@ export async function validatePath(
 
 
 // File Operations
+
+/**
+ * Counts a file's lines using editor convention: number of newline bytes,
+ * plus one when the file is non-empty and does not end with a newline.
+ * Reads sequential 64KB chunks — no full-file buffer.
+ */
+async function countFileLines(filePath: string): Promise<number> {
+  const CHUNK_SIZE = 64 * 1024;
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const chunk = Buffer.alloc(CHUNK_SIZE);
+    let newlines = 0;
+    let lastByte = -1;
+    let totalRead = 0;
+    let position = 0;
+    while (true) {
+      const { bytesRead } = await handle.read(chunk, 0, CHUNK_SIZE, position);
+      if (bytesRead === 0) break;
+      for (let i = 0; i < bytesRead; i++) {
+        if (chunk[i] === 0x0a) newlines++;
+      }
+      lastByte = chunk[bytesRead - 1];
+      totalRead += bytesRead;
+      position += bytesRead;
+    }
+    return newlines + (totalRead > 0 && lastByte !== 0x0a ? 1 : 0);
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function getFileStats(filePath: string): Promise<FileInfo> {
   const stats = await fs.stat(filePath);
-  return {
+  const info: FileInfo = {
     size: stats.size,
     created: stats.birthtime,
     modified: stats.mtime,
@@ -648,6 +661,10 @@ export async function getFileStats(filePath: string): Promise<FileInfo> {
     isFile: stats.isFile(),
     permissions: stats.mode.toString(8).slice(-3),
   };
+  if (stats.isFile()) {
+    info.lineCount = await countFileLines(filePath);
+  }
+  return info;
 }
 
 export async function readFileContent(filePath: string, encoding: string = 'utf-8'): Promise<string> {
@@ -655,15 +672,26 @@ export async function readFileContent(filePath: string, encoding: string = 'utf-
 }
 
 /**
+ * Splits content into lines, drops the first `offset` lines, then applies
+ * head (first N of the remainder) or tail (last N of the remainder) — never
+ * both. Offset beyond EOF yields an empty string. This implements the
+ * documented paging semantics: offset is applied BEFORE head/tail.
+ */
+export function sliceLines(content: string, offset: number, head?: number, tail?: number): string {
+  const lines = content.split('\n');
+  const remainder = offset >= lines.length ? [] : lines.slice(offset);
+  if (head !== undefined) {
+    return remainder.slice(0, head).join('\n');
+  }
+  if (tail !== undefined) {
+    return remainder.slice(Math.max(0, remainder.length - tail)).join('\n');
+  }
+  return remainder.join('\n');
+}
+
+/**
  * Writes content to a file, automatically creating parent directories if needed.
- * This is a "synthase" function - it creates new structures.
- * 
- * Like an enzyme, it has:
- * - Activation condition: valid path within allowed directories
- * - Substrate: file path and content
- * - Product: file written to disk
- * - Byproduct: list of directories created (if any)
- * 
+ *
  * @param filePath - The file path to write to
  * @param content - The content to write
  * @returns Detailed result including what was created
@@ -887,13 +915,27 @@ function resolveByContextExpansion(
 }
 
 /**
+ * Options for locateEdit.
+ */
+export interface LocateEditOptions {
+  /**
+   * When true (default), ambiguous multi-candidate matches may be resolved
+   * via context expansion. When false, ambiguity is reported instead — used
+   * by the chained-edit fallback pass, where context expansion could pick a
+   * match created by an earlier edit in the same batch.
+   */
+  allowContextExpansion?: boolean;
+}
+
+/**
  * Locates oldText within content for a single edit.
  *
  * Match strategy (in order):
  * 1. Exact substring match. If unique, the matched char span is returned with
  *    replacement = newText.
  * 2. If there are multiple exact candidates, git-apply-style context
- *    expansion disambiguates; if that fails the edit is ambiguous.
+ *    expansion disambiguates (unless disabled via options); if that fails the
+ *    edit is ambiguous.
  * 3. If there is no exact match, a whitespace-flexible whole-line scan is
  *    used (all matches counted, indentation-preserving replacement), with the
  *    same context-expansion disambiguation for multiple candidates.
@@ -905,8 +947,10 @@ function resolveByContextExpansion(
 export function locateEdit(
   content: string,
   oldText: string,
-  newText: string = ''
+  newText: string = '',
+  options: LocateEditOptions = {}
 ): EditLocation | null {
+  const { allowContextExpansion = true } = options;
   if (oldText.length === 0) return null;
 
   const exactOffsets = findSubstringOffsets(content, oldText);
@@ -923,7 +967,7 @@ export function locateEdit(
 
   if (exactOffsets.length > 1) {
     const candidates = exactOffsets.map(off => ({ start: off, end: off + oldText.length }));
-    const resolved = resolveByContextExpansion(content, candidates);
+    const resolved = allowContextExpansion ? resolveByContextExpansion(content, candidates) : -1;
     if (resolved !== -1) {
       const candidate = candidates[resolved];
       return {
@@ -957,7 +1001,7 @@ export function locateEdit(
     };
   }
   const candidates = flexible.map(m => ({ start: m.start, end: m.end }));
-  const resolved = resolveByContextExpansion(content, candidates);
+  const resolved = allowContextExpansion ? resolveByContextExpansion(content, candidates) : -1;
   if (resolved !== -1) {
     const match = flexible[resolved];
     return {
@@ -989,12 +1033,181 @@ export interface ApplyEditsOptions {
 }
 
 /**
- * Applies edits sequentially to in-memory content and returns the modified
- * content. Throws structured EDIT_FAILED errors; nothing is written here.
+ * Result of applying a batch of edits, with per-edit anchoring information.
+ */
+export interface EditResolution {
+  /** Content after all edits were applied. */
+  content: string;
+  /**
+   * One entry per edit (input order): 'original' when the edit was matched
+   * against the file content as read at the start of the call, 'chained'
+   * when its oldText only existed after an earlier edit had been applied.
+   */
+  appliedOrigin: Array<'original' | 'chained'>;
+}
+
+/** First non-empty line of a text, trimmed and capped at 60 chars, for error messages. */
+function firstLineSnippet(text: string): string {
+  const first = text.split('\n').find(l => l.trim().length > 0) ?? text;
+  return first.trim().substring(0, 60);
+}
+
+/** 1-based line range covered by a char span [start, end). */
+function spanLineRange(content: string, start: number, end: number): { from: number; to: number } {
+  return {
+    from: lineNumberAt(content, start),
+    to: lineNumberAt(content, Math.max(start, end - 1)),
+  };
+}
+
+/**
+ * Applies a batch of edits to in-memory content with original-anchored
+ * matching and all-or-nothing semantics:
  *
- * Edits chain within the call: edit 2 may reference text produced by edit 1.
- * Multi-occurrence oldText is rejected as ambiguous instead of silently
- * replacing the first occurrence.
+ * 1. Every edit is located against the ORIGINAL content (the content as read
+ *    at the start of the call). LLMs write edit lists against the file as
+ *    last read, so this is the happy path.
+ * 2. Original-anchored spans must be pairwise disjoint; overlap is a
+ *    contradiction between two edits against the same content and is
+ *    rejected, naming both edits.
+ * 3. Edits whose oldText only exists after an earlier edit (intentional
+ *    chaining) are resolved in a fixpoint fallback pass against the working
+ *    copy — strictly, without context expansion, so a batch-created duplicate
+ *    can never be picked over a pre-existing target.
+ * 4. If any edit remains unresolved, the whole batch is rejected with a
+ *    structured error; nothing is written here.
+ */
+export function applyEditsDetailed(
+  content: string,
+  edits: FileEdit[],
+  filePath: string,
+  options: ApplyEditsOptions = {}
+): EditResolution {
+  const appliedOrigin: Array<'original' | 'chained'> = edits.map(() => 'original');
+
+  if (edits.length === 0) {
+    return { content, appliedOrigin };
+  }
+
+  interface ResolvedSpan {
+    index: number;
+    start: number;
+    end: number;
+    replacement: string;
+  }
+
+  interface DeferredStatus {
+    status: 'not-found' | 'ambiguous';
+    matchLines: number[];
+  }
+
+  // Pass A — locate every edit against the original content.
+  const resolved: ResolvedSpan[] = [];
+  const deferred = new Map<number, DeferredStatus>();
+
+  edits.forEach((edit, index) => {
+    const normalizedOld = normalizeLineEndings(edit.oldText);
+    const normalizedNew = normalizeLineEndings(edit.newText);
+    const location = locateEdit(content, normalizedOld, normalizedNew);
+    if (location === null) {
+      deferred.set(index, { status: 'not-found', matchLines: [] });
+    } else if (location.occurrences > 1) {
+      deferred.set(index, { status: 'ambiguous', matchLines: location.matchLines });
+    } else {
+      resolved.push({
+        index,
+        start: location.start,
+        end: location.end,
+        replacement: location.replacement,
+      });
+    }
+  });
+
+  // Pass B — original-anchored spans must be pairwise disjoint.
+  for (let a = 0; a < resolved.length; a++) {
+    for (let b = a + 1; b < resolved.length; b++) {
+      const first = resolved[a];
+      const second = resolved[b];
+      if (first.start < second.end && second.start < first.end) {
+        const i = first.index + 1; // 1-based in messages
+        const j = second.index + 1;
+        const rangeI = spanLineRange(content, first.start, first.end);
+        const rangeJ = spanLineRange(content, second.start, second.end);
+        throw new Error(
+          `EDIT FAILED — NOTHING WAS WRITTEN\n` +
+          `  file: ${filePath}\n` +
+          `  reason: edits #${i} and #${j} target overlapping regions of the original file\n` +
+          `  edit #${i}: lines ${rangeI.from}-${rangeI.to} (1-based): "${firstLineSnippet(edits[first.index].oldText)}"\n` +
+          `  edit #${j}: lines ${rangeJ.from}-${rangeJ.to} (1-based): "${firstLineSnippet(edits[second.index].oldText)}"\n` +
+          `  next_step: merge these edits into one edit, or remove the overlap`
+        );
+      }
+    }
+  }
+
+  // Pass C — splice resolved spans back-to-front, then fixpoint on deferred.
+  let working = content;
+  const splices = [...resolved].sort((x, y) => y.start - x.start);
+  for (const span of splices) {
+    working = working.slice(0, span.start) + span.replacement + working.slice(span.end);
+  }
+
+  const deferredIndexes = () => [...deferred.keys()].sort((a, b) => a - b);
+  let progress = true;
+  while (progress && deferred.size > 0) {
+    progress = false;
+    for (const index of deferredIndexes()) {
+      const normalizedOld = normalizeLineEndings(edits[index].oldText);
+      const normalizedNew = normalizeLineEndings(edits[index].newText);
+      // Strict matching: no context expansion here — a batch-created
+      // duplicate must never be picked over a pre-existing target.
+      const location = locateEdit(working, normalizedOld, normalizedNew, { allowContextExpansion: false });
+      if (location === null) continue;
+      if (location.occurrences > 1) {
+        deferred.set(index, { status: 'ambiguous', matchLines: location.matchLines });
+        continue;
+      }
+      working = working.slice(0, location.start) + location.replacement + working.slice(location.end);
+      appliedOrigin[index] = 'chained';
+      deferred.delete(index);
+      progress = true;
+    }
+  }
+
+  // Pass D — outcome: reject the whole batch if any edit is unresolved.
+  if (deferred.size > 0) {
+    const lines: string[] = [
+      `EDIT FAILED — NOTHING WAS WRITTEN`,
+      `  file: ${filePath}`,
+      `  reason: ${deferred.size} of ${edits.length} edits could not be applied — the batch was rejected atomically`,
+    ];
+    for (const index of deferredIndexes()) {
+      const status = deferred.get(index)!;
+      const normalizedOld = normalizeLineEndings(edits[index].oldText);
+      if (status.status === 'not-found') {
+        lines.push(`  edit #${index + 1}: not found — hint: ${generateEditHint(content, normalizedOld)}`);
+      } else {
+        lines.push(
+          `  edit #${index + 1}: ambiguous — matches lines ${status.matchLines.join(', ')} (1-based); ` +
+          `include more surrounding lines in oldText`
+        );
+      }
+    }
+    if (options.dependencyHint) {
+      lines.push(`  note: ${options.dependencyHint}`);
+    }
+    lines.push(`  next_step: fix the listed edits and resubmit the whole batch`);
+    throw new Error(lines.join('\n'));
+  }
+
+  return { content: working, appliedOrigin };
+}
+
+/**
+ * Applies edits to in-memory content and returns the modified content.
+ * Thin wrapper around applyEditsDetailed (original-anchored matching with a
+ * chained fallback, all-or-nothing). Throws structured EDIT FAILED errors;
+ * nothing is written here.
  */
 export function applyEditsToContent(
   content: string,
@@ -1002,43 +1215,7 @@ export function applyEditsToContent(
   filePath: string,
   options: ApplyEditsOptions = {}
 ): string {
-  let modifiedContent = content;
-  for (const edit of edits) {
-    const normalizedOld = normalizeLineEndings(edit.oldText);
-    const normalizedNew = normalizeLineEndings(edit.newText);
-
-    const location = locateEdit(modifiedContent, normalizedOld, normalizedNew);
-
-    if (location === null) {
-      const hint = generateEditHint(content, normalizedOld);
-      throw new Error(
-        `EDIT_FAILED\n` +
-        `  file: ${filePath}\n` +
-        `  reason: oldText not found in file (exact match and whitespace-flexible match both failed)\n` +
-        `  hint: ${hint}\n` +
-        (options.dependencyHint ? `  note: ${options.dependencyHint}\n` : '') +
-        `  next_step: Read the file at the hinted location, then retry the edit with the correct oldText\n` +
-        `  no changes were written`
-      );
-    }
-
-    if (location.occurrences > 1) {
-      throw new Error(
-        `EDIT_FAILED\n` +
-        `  file: ${filePath}\n` +
-        `  reason: ambiguous — oldText matches ${location.occurrences} locations (exact and context-expanded matching could not disambiguate)\n` +
-        `  match_lines: ${location.matchLines.join(', ')} (1-based)\n` +
-        `  next_step: Include more surrounding lines in oldText so the match is unique, then retry\n` +
-        `  no changes were written`
-      );
-    }
-
-    modifiedContent =
-      modifiedContent.slice(0, location.start) +
-      location.replacement +
-      modifiedContent.slice(location.end);
-  }
-  return modifiedContent;
+  return applyEditsDetailed(content, edits, filePath, options).content;
 }
 
 /**
@@ -1067,7 +1244,8 @@ export async function applyFileEdits(
   // Read file content and normalize line endings
   const content = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
 
-  // Apply edits sequentially (throws structured EDIT_FAILED on failure)
+  // Apply edits (original-anchored with chained fallback; throws a
+  // structured EDIT FAILED error on failure, nothing is written)
   const modifiedContent = applyEditsToContent(content, edits, filePath);
 
   // Create unified diff

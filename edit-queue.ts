@@ -4,7 +4,7 @@ import { randomBytes } from 'crypto';
 import { diffLines } from 'diff';
 import { normalizePath } from './path-utils.js';
 import {
-  applyEditsToContent,
+  applyEditsDetailed,
   formatEditDiff,
   normalizeLineEndings,
   tryAcquireSubstrate,
@@ -197,12 +197,24 @@ function conflictError(
 }
 
 /**
+ * One-line success summary prefixed to every edit_file result: how many
+ * edits matched against the original content vs. were applied after earlier
+ * edits (chained). Cheap debuggability for anchoring surprises.
+ */
+function successSummary(edits: FileEdit[], appliedOrigin: Array<'original' | 'chained'>): string {
+  const originalCount = appliedOrigin.filter(origin => origin === 'original').length;
+  const chainedCount = appliedOrigin.length - originalCount;
+  return `${edits.length} edits applied (${originalCount} matched against original content, ` +
+    `${chainedCount} applied after earlier edits)\n\n`;
+}
+
+/**
  * Error for the staleness guard: the file changed externally between the
  * base read and the flush.
  */
 function externalChangeError(batch: ActiveBatch): Error {
   return new Error(
-    `EDIT_FAILED\n` +
+    `EDIT FAILED — NOTHING WAS WRITTEN\n` +
     `  file: ${batch.filePath}\n` +
     `  reason: file_changed_externally — the file was modified outside this edit batch between read and write\n` +
     `  next_step: Re-read the file and retry the edits against the current content\n` +
@@ -371,11 +383,11 @@ async function flushBatch(batch: ActiveBatch): Promise<void> {
 
 /**
  * Registers one call with an open batch once the base is loaded: applies the
- * call's edits sequentially against the base (chaining preserved), computes
- * its net spans, checks for conflicts against already-accepted calls in
- * registration order, and either accepts the call (rescheduling the flush
- * timer) or rejects it with a structured error. A failed call never aborts
- * the batch.
+ * call's edits against the base (original-anchored matching with a chained
+ * fallback), computes its net spans, checks for conflicts against
+ * already-accepted calls in registration order, and either accepts the call
+ * (rescheduling the flush timer) or rejects it with a structured error. A
+ * failed call never aborts the batch.
  */
 async function registerCall(batch: ActiveBatch, call: RegisteredCall): Promise<void> {
   try {
@@ -398,13 +410,16 @@ async function registerCall(batch: ActiveBatch, call: RegisteredCall): Promise<v
       return;
     }
 
-    // Apply the call's edits sequentially against the shared base snapshot.
+    // Apply the call's edits against the shared base snapshot.
     let finalContent: string;
+    let summary: string;
     try {
       const dependencyHint = batch.accepted.length > 0
         ? 'oldText may depend on another concurrent edit to this file — retry after the batch is stored'
         : undefined;
-      finalContent = applyEditsToContent(batch.base, call.edits, batch.filePath, { dependencyHint });
+      const resolution = applyEditsDetailed(batch.base, call.edits, batch.filePath, { dependencyHint });
+      finalContent = resolution.content;
+      summary = successSummary(call.edits, resolution.appliedOrigin);
     } catch (error) {
       call.reject(error instanceof Error ? error : new Error(String(error)));
       return;
@@ -424,7 +439,7 @@ async function registerCall(batch: ActiveBatch, call: RegisteredCall): Promise<v
       }
     }
 
-    const diff = formatEditDiff(batch.base, finalContent, batch.filePath);
+    const diff = summary + formatEditDiff(batch.base, finalContent, batch.filePath);
     batch.accepted.push({
       call,
       spans,
@@ -441,11 +456,12 @@ async function registerCall(batch: ActiveBatch, call: RegisteredCall): Promise<v
 
 /**
  * Entry point for edit_file. Queues a concurrent edit against the per-file
- * batch: resolves with the call's own unified diff, or rejects with a
- * structured EDIT_CONFLICT / EDIT_FAILED error.
+ * batch: resolves with the call's own unified diff (prefixed by a one-line
+ * success summary), or rejects with a structured EDIT_CONFLICT / EDIT FAILED
+ * error.
  *
- * dryRun bypasses the queue entirely: it reads fresh content, runs the
- * sequential logic with the hardened matcher, and writes nothing.
+ * dryRun bypasses the queue entirely: it reads fresh content, runs the batch
+ * resolver, and writes nothing.
  */
 export async function enqueueEdits(
   filePath: string,
@@ -454,8 +470,9 @@ export async function enqueueEdits(
 ): Promise<string> {
   if (dryRun) {
     const content = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
-    const modifiedContent = applyEditsToContent(content, edits, filePath);
-    return formatEditDiff(content, modifiedContent, filePath);
+    const resolution = applyEditsDetailed(content, edits, filePath);
+    return successSummary(edits, resolution.appliedOrigin) +
+      formatEditDiff(content, resolution.content, filePath);
   }
 
   const key = batchKey(filePath);

@@ -14,12 +14,13 @@ import {
   validatePath,
   getFileStats,
   readFileContent,
+  sliceLines,
   writeFileContent,
   searchFilesWithValidation,
   tailFile,
   headFile,
   setAllowedDirectories,
-  // New Reaktionsnetzwerk-inspired imports
+  // Core helpers
   ensureParentDirectory,
   createDirectoryRecursive,
   checkParentStatus,
@@ -100,10 +101,10 @@ setAllowedDirectories(allowedDirectories);
 // Schema definitions
 const ReadTextFileArgsSchema = z.object({
   path: z.string(),
-  tail: z.number().optional().describe('If provided, returns only the last N lines of the file'),
-  head: z.number().optional().describe('If provided, returns only the first N lines of the file'),
+  tail: z.number().optional().describe('If provided, returns only the last N lines of the remainder (after offset is applied)'),
+  head: z.number().optional().describe('If provided, returns only the first N lines of the remainder (after offset is applied)'),
   offset: z.number().int().min(0).optional().default(0)
-    .describe('0-based line offset: skip the first N lines before returning (applied after head/tail selection). Combine with head to page through a file: offset=100, head=50 returns lines 101-150.')
+    .describe('0-based line offset: skip the first N lines before returning. Applied BEFORE head/tail. Combine with head to page through a file: offset=100, head=50 returns lines 101-150.')
 });
 
 const ReadMediaFileArgsSchema = z.object({
@@ -190,7 +191,7 @@ const GetFileInfoArgsSchema = z.object({
 // Server setup
 const server = new FastMCP({
   name: "secure-filesystem-server",
-  version: "1.2.0",
+  version: "1.3.0",
 });
 
 // Reads a file as a stream of buffers, concatenates them, and then encodes
@@ -221,26 +222,21 @@ const readTextFileHandler = async (args: z.infer<typeof ReadTextFileArgsSchema>)
     throw new Error("Cannot specify both head and tail parameters simultaneously");
   }
 
-  let content: string;
+  // Offset applies BEFORE head/tail: skip the first N lines, then head/tail
+  // slice the remainder. offset > 0 requires a full read; offset === 0 keeps
+  // the streaming fast paths.
+  if (args.offset > 0) {
+    const content = await readFileContent(validPath);
+    return sliceLines(content, args.offset, args.head, args.tail);
+  }
+
   if (args.tail) {
-    content = await tailFile(validPath, args.tail);
-  } else if (args.head) {
-    content = await headFile(validPath, args.head);
-  } else {
-    content = await readFileContent(validPath);
+    return await tailFile(validPath, args.tail);
   }
-
-  // Line offset: skip the first N lines (applied after head/tail selection)
-  if (args.offset && args.offset > 0) {
-    const lines = content.split('\n');
-    if (args.offset >= lines.length) {
-      content = '';
-    } else {
-      content = lines.slice(args.offset).join('\n');
-    }
+  if (args.head) {
+    return await headFile(validPath, args.head);
   }
-
-  return content;
+  return await readFileContent(validPath);
 };
 
 server.addTool({
@@ -259,7 +255,10 @@ server.addTool({
     "if the file cannot be read. Use this tool when you need to examine " +
     "the contents of a single file. Use the 'head' parameter to read only " +
     "the first N lines of a file, or the 'tail' parameter to read only " +
-    "the last N lines of a file. Operates on the file as text regardless of extension. " +
+    "the last N lines of a file. Use 'offset' to skip the first N lines " +
+    "before head/tail are applied — combine offset with head to page " +
+    "through a file (offset=100, head=50 returns lines 101-150). " +
+    "Operates on the file as text regardless of extension. " +
     "Only works within allowed directories.",
   parameters: ReadTextFileArgsSchema,
   execute: readTextFileHandler,
@@ -373,14 +372,17 @@ server.addTool({
   name: "edit_file",
   description:
     "Make line-based edits to a text file. Each edit replaces exact line sequences " +
-    "with new content. Multiple edits in one call are applied as a single transaction " +
-    "(edit 2 may reference text produced by edit 1). Concurrent edit_file calls to the " +
-    "same file are automatically serialized and merged by the server: edits to disjoint " +
-    "regions all succeed and are stored in one atomic write, while overlapping concurrent " +
-    "edits are rejected with EDIT_CONFLICT naming both spans. Returns a git-style diff " +
-    "showing the changes made. On failure, returns EDIT_FAILED with a line-number hint — " +
-    "read the file at that location and retry with the correct oldText. " +
-    "Only works within allowed directories.",
+    "with new content. Edits are matched against the file content as read at the " +
+    "start of the call; an edit whose oldText only exists after an earlier edit in " +
+    "the same call is applied in a second pass. Two edits targeting overlapping " +
+    "regions of the original content are rejected. The batch is atomic: either all " +
+    "edits apply in one write, or nothing is written and the failure message starts " +
+    "with 'EDIT FAILED — NOTHING WAS WRITTEN' followed by a per-edit status. " +
+    "Concurrent edit_file calls to the same file are automatically serialized and " +
+    "merged by the server: edits to disjoint regions all succeed and are stored in " +
+    "one atomic write, while overlapping concurrent edits are rejected with " +
+    "EDIT_CONFLICT naming both spans. Returns a success summary and a git-style " +
+    "diff showing the changes made. Only works within allowed directories.",
   parameters: z.object({
     path: z.string(),
     edits: z.array(z.object({
@@ -635,7 +637,7 @@ server.addTool({
     destination: z.string()
   }),
   execute: async (args: z.infer<typeof MoveFileArgsSchema>) => {
-    // Use substrate lock for both source and destination
+    // Lock both source and destination for the move
     return withSubstrateLock(args.source, 'move', async () => {
       return withSubstrateLock(args.destination, 'move', async () => {
         const validSourcePath = await validatePath(args.source);
@@ -735,6 +737,7 @@ server.addTool({
     const validPath = await validatePath(args.path);
     const info = await getFileStats(validPath);
     return Object.entries(info)
+      .filter(([, value]) => value !== undefined)
       .map(([key, value]) => `${key}: ${value}`)
       .join("\n");
   },

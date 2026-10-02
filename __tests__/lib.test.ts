@@ -8,6 +8,7 @@ import {
   formatSize,
   normalizeLineEndings,
   createUnifiedDiff,
+  sliceLines,
   // Security & validation functions
   validatePath,
   setAllowedDirectories,
@@ -154,6 +155,48 @@ describe('Lib Functions', () => {
         expect(diff).toContain('+++ custom.txt');
       });
     });
+
+    describe('sliceLines', () => {
+      const content = Array.from({ length: 150 }, (_, i) => `line ${i + 1}`).join('\n');
+
+      it('applies offset before head: offset=100, head=50 returns lines 101-150', () => {
+        const result = sliceLines(content, 100, 50);
+        const lines = result.split('\n');
+        expect(lines).toHaveLength(50);
+        expect(lines[0]).toBe('line 101');
+        expect(lines[49]).toBe('line 150');
+      });
+
+      it('applies offset before tail: offset=10, tail=5 returns the last 5 lines of the remainder', () => {
+        const result = sliceLines(content, 10, undefined, 5);
+        const lines = result.split('\n');
+        expect(lines).toHaveLength(5);
+        expect(lines[0]).toBe('line 146');
+        expect(lines[4]).toBe('line 150');
+      });
+
+      it('returns empty for offset beyond EOF', () => {
+        expect(sliceLines(content, 500, 50)).toBe('');
+        expect(sliceLines(content, 500)).toBe('');
+      });
+
+      it('passes content through unchanged at offset=0 with no head/tail', () => {
+        expect(sliceLines('a\nb\nc', 0)).toBe('a\nb\nc');
+      });
+
+      it('applies head alone at offset=0', () => {
+        expect(sliceLines('a\nb\nc\nd', 0, 2)).toBe('a\nb');
+      });
+
+      it('applies tail alone at offset=0', () => {
+        expect(sliceLines('a\nb\nc\nd', 0, undefined, 2)).toBe('c\nd');
+      });
+
+      it('preserves the trailing newline of the remainder', () => {
+        expect(sliceLines('a\nb\nc\n', 1, 1)).toBe('b');
+        expect(sliceLines('a\nb\nc\n', 1)).toBe('b\nc\n');
+      });
+    });
   });
 
   describe('Security & Validation Functions', () => {
@@ -237,8 +280,23 @@ describe('Lib Functions', () => {
   });
 
   describe('File Operations', () => {
+    /** Mocks fs.open with a handle that serves the given bytes to reads. */
+    function mockFileBytes(bytes: string | Buffer) {
+      const source = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes as string);
+      const handle = {
+        read: vi.fn(async (target: Buffer, _offset: number, length: number, position: number) => {
+          const end = Math.min(position + length, source.length);
+          const copied = end > position ? source.copy(target, 0, position, end) : 0;
+          return { bytesRead: copied, buffer: target };
+        }),
+        close: vi.fn().mockResolvedValue(undefined),
+      };
+      mockFs.open.mockResolvedValue(handle);
+      return handle;
+    }
+
     describe('getFileStats', () => {
-      it('returns file statistics', async () => {
+      it('returns file statistics including lineCount', async () => {
         const mockStats = {
           size: 1024,
           birthtime: new Date('2023-01-01'),
@@ -248,11 +306,12 @@ describe('Lib Functions', () => {
           isFile: () => true,
           mode: 0o644
         };
-        
+
         mockFs.stat.mockResolvedValueOnce(mockStats as any);
-        
+        mockFileBytes('a\nb\nc');
+
         const result = await getFileStats('/test/file.txt');
-        
+
         expect(result).toEqual({
           size: 1024,
           created: new Date('2023-01-01'),
@@ -260,11 +319,66 @@ describe('Lib Functions', () => {
           accessed: new Date('2023-01-03'),
           isDirectory: false,
           isFile: true,
-          permissions: '644'
+          permissions: '644',
+          lineCount: 3
         });
       });
 
-      it('handles directory statistics', async () => {
+      it('counts lines with editor convention: trailing newline does not add a line', async () => {
+        const mockStats = {
+          size: 6,
+          birthtime: new Date('2023-01-01'),
+          mtime: new Date('2023-01-02'),
+          atime: new Date('2023-01-03'),
+          isDirectory: () => false,
+          isFile: () => true,
+          mode: 0o644
+        };
+
+        mockFs.stat.mockResolvedValueOnce(mockStats as any);
+        mockFileBytes('a\nb\nc\n');
+
+        const result = await getFileStats('/test/file.txt');
+        expect(result.lineCount).toBe(3);
+      });
+
+      it('counts a non-empty file without trailing newline as one line', async () => {
+        const mockStats = {
+          size: 3,
+          birthtime: new Date('2023-01-01'),
+          mtime: new Date('2023-01-02'),
+          atime: new Date('2023-01-03'),
+          isDirectory: () => false,
+          isFile: () => true,
+          mode: 0o644
+        };
+
+        mockFs.stat.mockResolvedValueOnce(mockStats as any);
+        mockFileBytes('abc');
+
+        const result = await getFileStats('/test/file.txt');
+        expect(result.lineCount).toBe(1);
+      });
+
+      it('reports lineCount 0 for an empty file', async () => {
+        const mockStats = {
+          size: 0,
+          birthtime: new Date('2023-01-01'),
+          mtime: new Date('2023-01-02'),
+          atime: new Date('2023-01-03'),
+          isDirectory: () => false,
+          isFile: () => true,
+          mode: 0o644
+        };
+
+        mockFs.stat.mockResolvedValueOnce(mockStats as any);
+        mockFileBytes('');
+
+        const result = await getFileStats('/test/file.txt');
+        expect(result.lineCount).toBe(0);
+      });
+
+      it('handles directory statistics and omits lineCount', async () => {
         const mockStats = {
           size: 4096,
           birthtime: new Date('2023-01-01'),
@@ -274,14 +388,16 @@ describe('Lib Functions', () => {
           isFile: () => false,
           mode: 0o755
         };
-        
+
         mockFs.stat.mockResolvedValueOnce(mockStats as any);
-        
+
         const result = await getFileStats('/test/dir');
-        
+
         expect(result.isDirectory).toBe(true);
         expect(result.isFile).toBe(false);
         expect(result.permissions).toBe('755');
+        expect(result).not.toHaveProperty('lineCount');
+        expect(mockFs.open).not.toHaveBeenCalled();
       });
     });
 
@@ -517,9 +633,10 @@ describe('Lib Functions', () => {
           { oldText: 'nonexistent line', newText: 'replacement' }
         ];
 
-        // Updated to match current error contract: EDIT_FAILED with line-number hint
+        // Updated to match current error contract: EDIT FAILED — NOTHING WAS
+        // WRITTEN, with a line-number hint
         await expect(applyFileEdits('/test/file.txt', edits, false))
-          .rejects.toThrow('EDIT_FAILED');
+          .rejects.toThrow('EDIT FAILED — NOTHING WAS WRITTEN');
       });
 
       it('handles complex multi-line edits with indentation', async () => {
@@ -594,12 +711,12 @@ describe('Lib Functions', () => {
         );
       });
 
-      it('fails with EDIT_FAILED ambiguous for multi-occurrence oldText instead of replacing the first', async () => {
+      it('fails with EDIT FAILED ambiguous for multi-occurrence oldText instead of replacing the first', async () => {
         mockFs.readFile.mockResolvedValue('dup\nX\ndup\nY\n');
         mockFs.writeFile.mockResolvedValue(undefined);
 
         await expect(applyFileEdits('/test/file.txt', [{ oldText: 'dup', newText: 'Z' }], false))
-          .rejects.toThrow(/EDIT_FAILED[\s\S]*ambiguous[\s\S]*2 locations[\s\S]*match_lines: 1, 3/);
+          .rejects.toThrow(/EDIT FAILED — NOTHING WAS WRITTEN[\s\S]*ambiguous[\s\S]*matches lines 1, 3/);
         expect(mockFs.writeFile).not.toHaveBeenCalled();
       });
 

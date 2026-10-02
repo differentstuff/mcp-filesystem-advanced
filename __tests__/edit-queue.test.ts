@@ -111,7 +111,7 @@ describe('edit-queue', () => {
 
       // Attach the rejection expectation first: the dependent call fails at
       // join time, before the sibling promise is awaited.
-      const secondExpect = expect(second).rejects.toThrow(/EDIT_FAILED[\s\S]*not found[\s\S]*concurrent edit/);
+      const secondExpect = expect(second).rejects.toThrow(/EDIT FAILED — NOTHING WAS WRITTEN[\s\S]*not found[\s\S]*concurrent edit/);
       await expect(first).resolves.toContain('diff');
       await secondExpect;
 
@@ -130,7 +130,7 @@ describe('edit-queue', () => {
       mockFs.rename.mockResolvedValue(undefined);
 
       await expect(enqueueEdits(FILE_PATH, [{ oldText: 'dup', newText: 'Z' }], false))
-        .rejects.toThrow(/EDIT_FAILED[\s\S]*ambiguous[\s\S]*2 locations[\s\S]*match_lines: 1, 3/);
+        .rejects.toThrow(/EDIT FAILED — NOTHING WAS WRITTEN[\s\S]*ambiguous[\s\S]*matches lines 1, 3/);
 
       expect(mockFs.writeFile).not.toHaveBeenCalled();
     });
