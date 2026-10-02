@@ -148,7 +148,7 @@ describe('edit-queue', () => {
 
       const batchCall = enqueueEdits(filePath, [{ oldText: 'A2', newText: 'B2' }], false);
 
-      // The batch holds the 'write' substrate for its window
+      // The batch holds the 'write' path lock for its window
       await expect(writeFileContent(filePath, 'clobber')).rejects.toThrow('Operation conflict');
 
       await expect(batchCall).resolves.toContain('diff');
@@ -172,7 +172,7 @@ describe('edit-queue', () => {
       expect(mockFs.writeFile).not.toHaveBeenCalled();
     });
 
-    it('releases the substrate after a failed flush so later writes succeed', async () => {
+    it('releases the path lock after a failed flush so later writes succeed', async () => {
       const filePath = process.platform === 'win32' ? 'C:\\allowed\\file.txt' : '/allowed/file.txt';
       const content = 'A1\nA2\nA3\n';
       mockFs.readFile.mockResolvedValue(content);
@@ -187,7 +187,7 @@ describe('edit-queue', () => {
       await expect(enqueueEdits(filePath, [{ oldText: 'A1', newText: 'B1' }], false))
         .rejects.toThrow('file_changed_externally');
 
-      // The batch's 'write' substrate was released in the flush's finally block
+      // The batch's 'write' path lock was released in the flush's finally block
       await expect(writeFileContent(filePath, 'fresh')).resolves.toBeTruthy();
     });
   });

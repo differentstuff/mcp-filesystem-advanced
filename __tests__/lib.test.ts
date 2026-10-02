@@ -32,6 +32,26 @@ vi.mock('child_process');
 const mockFs = fs as any;
 const mockCp = (await import('child_process')).execFile as any;
 
+/**
+ * Mocks fs.open with a handle that serves the given bytes to reads at
+ * absolute positions — emulating real fs.read semantics, where data is
+ * written INTO the caller-supplied buffer (the returned `buffer` property
+ * is ignored by callers).
+ */
+function mockFileBytes(bytes: string | Buffer) {
+  const source = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes as string);
+  const handle = {
+    read: vi.fn(async (target: Buffer, _offset: number, length: number, position: number) => {
+      const end = Math.min(position + length, source.length);
+      const copied = end > position ? source.copy(target, 0, position, end) : 0;
+      return { bytesRead: copied, buffer: target };
+    }),
+    close: vi.fn().mockResolvedValue(undefined),
+  };
+  mockFs.open.mockResolvedValue(handle);
+  return handle;
+}
+
 describe('Lib Functions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -280,21 +300,6 @@ describe('Lib Functions', () => {
   });
 
   describe('File Operations', () => {
-    /** Mocks fs.open with a handle that serves the given bytes to reads. */
-    function mockFileBytes(bytes: string | Buffer) {
-      const source = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes as string);
-      const handle = {
-        read: vi.fn(async (target: Buffer, _offset: number, length: number, position: number) => {
-          const end = Math.min(position + length, source.length);
-          const copied = end > position ? source.copy(target, 0, position, end) : 0;
-          return { bytesRead: copied, buffer: target };
-        }),
-        close: vi.fn().mockResolvedValue(undefined),
-      };
-      mockFs.open.mockResolvedValue(handle);
-      return handle;
-    }
-
     describe('getFileStats', () => {
       it('returns file statistics including lineCount', async () => {
         const mockStats = {
@@ -824,119 +829,102 @@ describe('Lib Functions', () => {
         expect(mockFs.open).toHaveBeenCalledWith('/test/file.txt', 'r');
       });
 
-      it('handles files with content and returns last lines', async () => {
-        mockFs.stat.mockResolvedValue({ size: 50 } as any);
-        
-        const mockFileHandle = {
-          read: vi.fn(),
-          close: vi.fn()
-        } as any;
-        
-        // Simulate reading file content in chunks
-        mockFileHandle.read
-          .mockResolvedValueOnce({ bytesRead: 20, buffer: Buffer.from('line3\nline4\nline5\n') })
-          .mockResolvedValueOnce({ bytesRead: 0 });
-        mockFileHandle.close.mockResolvedValue(undefined);
-        
-        mockFs.open.mockResolvedValue(mockFileHandle);
-        
+      it('returns the last N lines of a file without trailing newline', async () => {
+        mockFileBytes('line1\nline2\nline3');
+        mockFs.stat.mockResolvedValue({ size: 17 } as any);
+
         const result = await tailFile('/test/file.txt', 2);
-        
-        expect(mockFileHandle.close).toHaveBeenCalled();
+
+        expect(result).toBe('line2\nline3');
+        expect(mockFs.open).toHaveBeenCalledWith('/test/file.txt', 'r');
       });
 
-      it('handles read errors gracefully', async () => {
-        mockFs.stat.mockResolvedValue({ size: 100 } as any);
-        
-        const mockFileHandle = {
-          read: vi.fn(),
-          close: vi.fn()
-        } as any;
-        
-        mockFileHandle.read.mockResolvedValue({ bytesRead: 0 });
-        mockFileHandle.close.mockResolvedValue(undefined);
-        
-        mockFs.open.mockResolvedValue(mockFileHandle);
-        
-        await tailFile('/test/file.txt', 5);
-        
-        expect(mockFileHandle.close).toHaveBeenCalled();
+      it('returns the last N lines across multiple chunk reads', async () => {
+        // 1KB chunk size: a 3KB file forces several reads; the tail must
+        // still be assembled correctly across chunk boundaries.
+        const lines = Array.from({ length: 300 }, (_, i) => `line ${String(i + 1).padStart(3, '0')}`);
+        const content = lines.join('\n');
+        mockFileBytes(content);
+        mockFs.stat.mockResolvedValue({ size: content.length } as any);
+
+        const result = await tailFile('/test/file.txt', 2);
+
+        expect(result).toBe('line 299\nline 300');
+      });
+
+      it('counts the empty string after a trailing newline as a line (current convention)', async () => {
+        // Pins current behavior: 'a\nb\nc\n' splits into ['a','b','c',''],
+        // so tail=2 returns 'c\n'. If the convention ever changes to editor
+        // semantics ('b\nc'), update this test deliberately.
+        mockFileBytes('line1\nline2\nline3\n');
+        mockFs.stat.mockResolvedValue({ size: 18 } as any);
+
+        const result = await tailFile('/test/file.txt', 2);
+
+        expect(result).toBe('line3\n');
+      });
+
+      it('rejects and still closes the handle when a read fails', async () => {
+        const handle = mockFileBytes('line1\nline2\nline3');
+        handle.read.mockRejectedValueOnce(new Error('read failed'));
+        mockFs.stat.mockResolvedValue({ size: 17 } as any);
+
+        await expect(tailFile('/test/file.txt', 2)).rejects.toThrow('read failed');
+        expect(handle.close).toHaveBeenCalled();
       });
     });
 
     describe('headFile', () => {
       it('opens file for reading', async () => {
-        // Mock file handle with proper typing
-        const mockFileHandle = {
-          read: vi.fn(),
-          close: vi.fn()
-        } as any;
-        
-        mockFileHandle.read.mockResolvedValue({ bytesRead: 0 });
-        mockFileHandle.close.mockResolvedValue(undefined);
-        
-        mockFs.open.mockResolvedValue(mockFileHandle);
-        
+        mockFileBytes('line1\nline2\nline3');
+
         await headFile('/test/file.txt', 2);
-        
+
         expect(mockFs.open).toHaveBeenCalledWith('/test/file.txt', 'r');
       });
 
-      it('handles files with content and returns first lines', async () => {
-        const mockFileHandle = {
-          read: vi.fn(),
-          close: vi.fn()
-        } as any;
-        
-        // Simulate reading file content with newlines
-        mockFileHandle.read
-          .mockResolvedValueOnce({ bytesRead: 20, buffer: Buffer.from('line1\nline2\nline3\n') })
-          .mockResolvedValueOnce({ bytesRead: 0 });
-        mockFileHandle.close.mockResolvedValue(undefined);
-        
-        mockFs.open.mockResolvedValue(mockFileHandle);
-        
+      it('returns the first N lines of a file without trailing newline', async () => {
+        mockFileBytes('line1\nline2\nline3\nline4');
+
         const result = await headFile('/test/file.txt', 2);
-        
-        expect(mockFileHandle.close).toHaveBeenCalled();
+
+        expect(result).toBe('line1\nline2');
       });
 
-      it('handles files with leftover content', async () => {
-        const mockFileHandle = {
-          read: vi.fn(),
-          close: vi.fn()
-        } as any;
-        
-        // Simulate reading file content without final newline
-        mockFileHandle.read
-          .mockResolvedValueOnce({ bytesRead: 15, buffer: Buffer.from('line1\nline2\nend') })
-          .mockResolvedValueOnce({ bytesRead: 0 });
-        mockFileHandle.close.mockResolvedValue(undefined);
-        
-        mockFs.open.mockResolvedValue(mockFileHandle);
-        
+      it('returns all lines when fewer exist than requested', async () => {
+        mockFileBytes('line1\nline2\nend');
+
         const result = await headFile('/test/file.txt', 5);
-        
-        expect(mockFileHandle.close).toHaveBeenCalled();
+
+        expect(result).toBe('line1\nline2\nend');
       });
 
-      it('handles reaching requested line count', async () => {
-        const mockFileHandle = {
-          read: vi.fn(),
-          close: vi.fn()
-        } as any;
-        
-        // Simulate reading exactly the requested number of lines
-        mockFileHandle.read
-          .mockResolvedValueOnce({ bytesRead: 12, buffer: Buffer.from('line1\nline2\n') })
-          .mockResolvedValueOnce({ bytesRead: 0 });
-        mockFileHandle.close.mockResolvedValue(undefined);
-        
-        mockFs.open.mockResolvedValue(mockFileHandle);
-        
+      it('stops at the requested line count when the file has a trailing newline', async () => {
+        mockFileBytes('line1\nline2\nline3\n');
+
         const result = await headFile('/test/file.txt', 2);
-        
-        expect(mockFileHandle.close).toHaveBeenCalled();
+
+        expect(result).toBe('line1\nline2');
+      });
+
+      it('returns lines assembled across multiple chunk reads', async () => {
+        // 1KB chunk size: a 3KB file forces several reads; the head must
+        // still stop exactly at the requested line count.
+        const lines = Array.from({ length: 300 }, (_, i) => `line ${String(i + 1).padStart(3, '0')}`);
+        const content = lines.join('\n');
+        mockFileBytes(content);
+
+        const result = await headFile('/test/file.txt', 2);
+
+        expect(result).toBe('line 001\nline 002');
+      });
+
+      it('rejects and still closes the handle when a read fails', async () => {
+        const handle = mockFileBytes('line1\nline2\nline3');
+        handle.read.mockRejectedValueOnce(new Error('read failed'));
+
+        await expect(headFile('/test/file.txt', 2)).rejects.toThrow('read failed');
+        expect(handle.close).toHaveBeenCalled();
       });
     });
   });

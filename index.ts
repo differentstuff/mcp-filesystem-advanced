@@ -24,7 +24,7 @@ import {
   ensureParentDirectory,
   createDirectoryRecursive,
   checkParentStatus,
-  withSubstrateLock,
+  withPathLock,
   type WriteResult,
   type DirectoryResult,
   type OperationType,
@@ -638,8 +638,8 @@ server.addTool({
   }),
   execute: async (args: z.infer<typeof MoveFileArgsSchema>) => {
     // Lock both source and destination for the move
-    return withSubstrateLock(args.source, 'move', async () => {
-      return withSubstrateLock(args.destination, 'move', async () => {
+    return withPathLock(args.source, 'move', async () => {
+      return withPathLock(args.destination, 'move', async () => {
         const validSourcePath = await validatePath(args.source);
         const validDestPath = await validatePath(args.destination, { allowMissingParent: true });
         

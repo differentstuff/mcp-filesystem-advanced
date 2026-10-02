@@ -7,8 +7,8 @@ import {
   applyEditsDetailed,
   formatEditDiff,
   normalizeLineEndings,
-  tryAcquireSubstrate,
-  releaseSubstrate,
+  tryAcquirePathLock,
+  releasePathLock,
   type FileEdit,
   type OperationInfo,
 } from './lib.js';
@@ -78,14 +78,14 @@ interface ActiveBatch {
   flushing: boolean;
   finalized: boolean;
   flushPromise: Promise<void>;
-  substrateOp: OperationInfo;
+  pathLockOp: OperationInfo;
 }
 
 /** Open batch per resolved file path. */
 const batches = new Map<string, ActiveBatch>();
 
 /**
- * Map key for a file path, consistent with the substrate tracker's
+ * Map key for a file path, consistent with the operation tracker's
  * normalization.
  */
 function batchKey(filePath: string): string {
@@ -223,12 +223,12 @@ function externalChangeError(batch: ActiveBatch): Error {
 }
 
 /**
- * Creates a new batch for the path: acquires the 'write' substrate for the
+ * Creates a new batch for the path: acquires the 'write' path lock for the
  * window and starts the shared base read (content + mtime/size capture).
- * Throws the substrate conflict error if a conflicting operation is active.
+ * Throws the lock-conflict error if a conflicting operation is active.
  */
 function createBatch(filePath: string): ActiveBatch {
-  const acquire = tryAcquireSubstrate(filePath, 'write');
+  const acquire = tryAcquirePathLock(filePath, 'write');
   if (!acquire.success) {
     const conflict = acquire.conflict!;
     throw new Error(
@@ -250,7 +250,7 @@ function createBatch(filePath: string): ActiveBatch {
     flushing: false,
     finalized: false,
     flushPromise: Promise.resolve(),
-    substrateOp: acquire.acquired!,
+    pathLockOp: acquire.acquired!,
   };
 
   batch.loading = (async () => {
@@ -285,12 +285,12 @@ function scheduleFlush(batch: ActiveBatch): void {
 }
 
 /**
- * Releases the substrate and removes the batch record exactly once.
+ * Releases the path lock and removes the batch record exactly once.
  */
 function finalizeBatch(batch: ActiveBatch): void {
   if (batch.finalized) return;
   batch.finalized = true;
-  releaseSubstrate(batch.substrateOp);
+  releasePathLock(batch.pathLockOp);
   batches.delete(batchKey(batch.filePath));
 }
 
@@ -332,7 +332,7 @@ function mergeSpans(batch: ActiveBatch): string {
 /**
  * Flushes the batch: staleness guard, single atomic write (temp + rename),
  * then settles every accepted call with its own diff. Always releases the
- * substrate and deletes the batch record.
+ * path lock and deletes the batch record.
  */
 async function flushBatch(batch: ActiveBatch): Promise<void> {
   if (batch.flushing || batch.finalized) return;

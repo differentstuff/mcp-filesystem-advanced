@@ -91,7 +91,7 @@ export interface AcquireResult {
  * - Read operations can share a path
  * - Write operations are exclusive
  */
-class SubstrateTracker {
+class OperationTracker {
   private activeOperations: Map<string, OperationInfo[]> = new Map();
   private operationTimeout: number;
 
@@ -235,18 +235,18 @@ class SubstrateTracker {
 }
 
 // Global operation tracker instance
-const substrateTracker = new SubstrateTracker();
+const operationTracker = new OperationTracker();
 
 /**
  * Execute a filesystem operation with path-lock tracking.
  * Wraps the operation with automatic acquire/release semantics.
  */
-export async function withSubstrateLock<T>(
+export async function withPathLock<T>(
   filePath: string,
   type: OperationType,
   operation: () => Promise<T>
 ): Promise<T> {
-  const acquireResult = substrateTracker.tryAcquire(filePath, type);
+  const acquireResult = operationTracker.tryAcquire(filePath, type);
   
   if (!acquireResult.success) {
     const conflict = acquireResult.conflict!;
@@ -260,7 +260,7 @@ export async function withSubstrateLock<T>(
   try {
     return await operation();
   } finally {
-    substrateTracker.release(acquireResult.acquired!);
+    operationTracker.release(acquireResult.acquired!);
   }
 }
 
@@ -269,15 +269,15 @@ export async function withSubstrateLock<T>(
  * Used by the edit batch queue, which must hold the 'write' lock across
  * a whole batch window rather than around a single awaited operation.
  */
-export function tryAcquireSubstrate(filePath: string, type: OperationType): AcquireResult {
-  return substrateTracker.tryAcquire(filePath, type);
+export function tryAcquirePathLock(filePath: string, type: OperationType): AcquireResult {
+  return operationTracker.tryAcquire(filePath, type);
 }
 
 /**
- * Release a path lock previously acquired via tryAcquireSubstrate.
+ * Release a path lock previously acquired via tryAcquirePathLock.
  */
-export function releaseSubstrate(operation: OperationInfo): void {
-  substrateTracker.release(operation);
+export function releasePathLock(operation: OperationInfo): void {
+  operationTracker.release(operation);
 }
 
 // Function to set allowed directories from the main module
@@ -697,7 +697,7 @@ export function sliceLines(content: string, offset: number, head?: number, tail?
  * @returns Detailed result including what was created
  */
 export async function writeFileContent(filePath: string, content: string): Promise<WriteResult> {
-  return withSubstrateLock(filePath, 'write', async () => {
+  return withPathLock(filePath, 'write', async () => {
     // Validate path with allowMissingParent=true so we can auto-create parents
     const validPath = await validatePath(filePath, { allowMissingParent: true });
     

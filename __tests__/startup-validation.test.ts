@@ -73,9 +73,14 @@ describe('Startup Directory Validation', () => {
 
   it('should start successfully with all accessible directories', async () => {
     const result = await spawnServer([accessibleDir, accessibleDir2], 10000, STARTED_BANNER);
-    // Server started (killed once the banner appeared) and logged no errors
+    // Server started (killed once the banner appeared) and reported no
+    // startup failure. Only the specific startup-failure messages are
+    // asserted against: after the banner, the SIGTERM shutdown itself can
+    // log transport noise (e.g. broken-pipe errors), which is not a
+    // startup failure and must not fail this test.
     expect(result.stderr).toContain(STARTED_BANNER);
-    expect(result.stderr).not.toContain('Error:');
+    expect(result.stderr).not.toContain('Error: None of the specified directories are accessible');
+    expect(result.stderr).not.toContain('Fatal error running server');
   });
 
   it('should skip inaccessible directory and continue with accessible one', async () => {
