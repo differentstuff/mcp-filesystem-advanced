@@ -121,4 +121,25 @@ describe('read_text_file paging / tail contract (integration)', () => {
     const after = await fs.readFile(path.join(testDir, 'trailing.txt'), 'utf-8');
     expect(after).toBe('a\nb\nc\n');
   });
+
+  it.each([
+    ['head', 0],
+    ['tail', 0],
+  ])('rejects %s=0 at schema validation (contradictory: full file via one path, empty via the other)', async (_param, zero) => {
+    let rejected = false;
+    try {
+      const result = await client.callTool({
+        name: 'read_text_file',
+        arguments: { path: path.join(testDir, 'trailing.txt'), [_param]: zero },
+      });
+      rejected = (result as { isError?: boolean }).isError === true;
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
+
+    // The file must be untouched
+    const after = await fs.readFile(path.join(testDir, 'trailing.txt'), 'utf-8');
+    expect(after).toBe('a\nb\nc\n');
+  });
 });

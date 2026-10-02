@@ -102,9 +102,9 @@ setAllowedDirectories(allowedDirectories);
 // Schema definitions
 const ReadTextFileArgsSchema = z.object({
   path: z.string(),
-  tail: z.number().int().min(0).optional()
+  tail: z.number().int().min(1).optional()
     .describe('If provided, returns only the last N lines of the file (editor convention: a trailing newline terminates the last line, it does not start an extra empty one)'),
-  head: z.number().int().min(0).optional()
+  head: z.number().int().min(1).optional()
     .describe('If provided, returns only the first N lines of the file'),
   offset: z.number().int().min(0).optional().default(0)
     .describe('0-based line offset: skip the first N lines before returning. Applied BEFORE head/tail. Combine with head to page through a file: offset=100, head=50 returns lines 101-150.')
@@ -249,7 +249,9 @@ const readTextFileHandler = async (args: z.infer<typeof ReadTextFileArgsSchema>)
 
 server.addTool({
   name: "read_file",
-  description: "Read the complete contents of a file as text. DEPRECATED: Use read_text_file instead.",
+  description:
+    "Deprecated alias of read_text_file — same parameters (path, head, tail, offset), " +
+    "same behavior. Use read_text_file instead.",
   parameters: ReadTextFileArgsSchema,
   execute: readTextFileHandler,
   annotations: { readOnlyHint: true }

@@ -11,50 +11,15 @@ An enhanced Model Context Protocol (MCP) server for filesystem access with opera
 
 ## Installation
 
-All dependencies are pinned to exact versions in `package.json`. The lock file (`package-lock.json`) guarantees identical installs across machines.
-
 ```bash
-# Clone or copy the repository
-cd mcp-filesystem-advanced
-
-# Install pinned dependencies and build (uses npm ci for strict reproducibility)
-./setup.sh
+./setup.sh        # installs dependencies and builds
 ```
 
-### Setup Options
-
-| Command | What it does |
-|---------|-------------|
-| `./setup.sh` | Install exact versions from lock file, then build |
-| `./setup.sh --check` | Show available updates and known vulnerabilities (dry run) |
-| `./setup.sh --update-patch` | Bump patch versions only (e.g. 3.2.4 → 3.2.6), then build |
-| `./setup.sh --update` | Bump all dependencies to latest, then build |
-
-**Why `npm ci`?** Unlike `npm install`, `npm ci` installs *exactly* the dependency tree recorded in the lock file. It deletes `node_modules` first and fails if the lock file is out of sync — no silent drift. This guarantees that every machine gets the same build.
-
-### Manual Alternative
-
-If you prefer not to use `setup.sh`:
+Or manually:
 
 ```bash
-npm ci          # Strict install from lock file (recommended)
-npm run build   # Compile TypeScript
-```
-
-### Checking for Updates
-
-```bash
-# See what's outdated
-npm run deps:check
-
-# Bump patch versions only (safest)
-npm run deps:update:patch
-
-# Bump minor versions
-npm run deps:update:minor
-
-# Bump everything to latest
-npm run deps:update
+npm install
+npm run build
 ```
 
 ## Configuration Examples
