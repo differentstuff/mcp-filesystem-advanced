@@ -672,21 +672,34 @@ export async function readFileContent(filePath: string, encoding: string = 'utf-
 }
 
 /**
- * Splits content into lines, drops the first `offset` lines, then applies
- * head (first N of the remainder) or tail (last N of the remainder) — never
- * both. Offset beyond EOF yields an empty string. This implements the
- * documented paging semantics: offset is applied BEFORE head/tail.
+ * Splits content into editor-convention lines (a trailing newline marks a
+ * line boundary, not an extra empty line), drops the first `offset` lines,
+ * then applies head (first N of the remainder) or tail (last N of the
+ * remainder) — never both. Offset beyond EOF yields an empty string.
+ *
+ * With head/tail, the selected lines are joined with LF (no trailing
+ * newline — symmetric with headFile/tailFile). Without head/tail, the
+ * remainder is passed through as exact file content, preserving the
+ * trailing newline. CRLF input is normalized to LF.
  */
 export function sliceLines(content: string, offset: number, head?: number, tail?: number): string {
-  const lines = content.split('\n');
-  const remainder = offset >= lines.length ? [] : lines.slice(offset);
+  const normalized = normalizeLineEndings(content);
+  const endsWithNewline = normalized.endsWith('\n');
+  const lines = endsWithNewline ? normalized.slice(0, -1).split('\n') : normalized.split('\n');
+
+  if (offset >= lines.length) {
+    return '';
+  }
+  const remainder = lines.slice(offset);
+
   if (head !== undefined) {
     return remainder.slice(0, head).join('\n');
   }
   if (tail !== undefined) {
     return remainder.slice(Math.max(0, remainder.length - tail)).join('\n');
   }
-  return remainder.join('\n');
+  // Offset-only: passthrough of the exact remainder, trailing newline kept.
+  return remainder.join('\n') + (endsWithNewline ? '\n' : '');
 }
 
 /**
@@ -1236,48 +1249,14 @@ export function formatEditDiff(
   return `${'`'.repeat(numBackticks)}diff\n${diff}${'`'.repeat(numBackticks)}\n\n`;
 }
 
-export async function applyFileEdits(
-  filePath: string,
-  edits: FileEdit[],
-  dryRun: boolean = false
-): Promise<string> {
-  // Read file content and normalize line endings
-  const content = normalizeLineEndings(await fs.readFile(filePath, 'utf-8'));
-
-  // Apply edits (original-anchored with chained fallback; throws a
-  // structured EDIT FAILED error on failure, nothing is written)
-  const modifiedContent = applyEditsToContent(content, edits, filePath);
-
-  // Create unified diff
-  const formattedDiff = formatEditDiff(content, modifiedContent, filePath);
-
-  if (!dryRun) {
-    // Security: Use atomic rename to prevent race conditions where symlinks
-    // could be created between validation and write. Rename operations
-    // replace the target file atomically and don't follow symlinks.
-    const tempPath = `${filePath}.${randomBytes(16).toString('hex')}.tmp`;
-    try {
-      await fs.writeFile(tempPath, modifiedContent, 'utf-8');
-      await fs.rename(tempPath, filePath);
-    } catch (error) {
-      try {
-        await fs.unlink(tempPath);
-      } catch {}
-      throw error;
-    }
-  }
-
-  return formattedDiff;
-}
-
 // Memory-efficient implementation to get the last N lines of a file
 export async function tailFile(filePath: string, numLines: number): Promise<string> {
   const CHUNK_SIZE = 1024; // Read 1KB at a time
   const stats = await fs.stat(filePath);
   const fileSize = stats.size;
-  
+
   if (fileSize === 0) return '';
-  
+
   // Open file for reading
   const fileHandle = await fs.open(filePath, 'r');
   try {
@@ -1286,43 +1265,52 @@ export async function tailFile(filePath: string, numLines: number): Promise<stri
     let chunk = Buffer.alloc(CHUNK_SIZE);
     let linesFound = 0;
     let remainingText = '';
-    
+    let firstChunk = true;
+
     // Read chunks from the end of the file until we have enough lines
     while (position > 0 && linesFound < numLines) {
       const size = Math.min(CHUNK_SIZE, position);
       position -= size;
-      
+
       const { bytesRead } = await fileHandle.read(chunk, 0, size, position);
       if (!bytesRead) break;
-      
+
       // Get the chunk as a string and prepend any remaining text from previous iteration
       const readData = chunk.slice(0, bytesRead).toString('utf-8');
       const chunkText = readData + remainingText;
-      
+
       // Split by newlines and count
       const chunkLines = normalizeLineEndings(chunkText).split('\n');
-      
+
+      // The first chunk read covers EOF: when the file ends with a newline,
+      // the split's trailing '' is the position after the final newline, not
+      // a line — drop it (editor convention, symmetric with headFile).
+      if (firstChunk && chunkLines.length > 0 && chunkLines[chunkLines.length - 1] === '') {
+        chunkLines.pop();
+      }
+      firstChunk = false;
+
       // If this isn't the end of the file, the first line is likely incomplete
       // Save it to prepend to the next chunk
       if (position > 0) {
         remainingText = chunkLines[0];
         chunkLines.shift(); // Remove the first (incomplete) line
       }
-      
+
       // Add lines to our result (up to the number we need)
       for (let i = chunkLines.length - 1; i >= 0 && linesFound < numLines; i--) {
         lines.unshift(chunkLines[i]);
         linesFound++;
       }
     }
-    
+
     return lines.join('\n');
   } finally {
     await fileHandle.close();
   }
 }
 
-// New function to get the first N lines of a file
+// Get the first N lines of a file
 export async function headFile(filePath: string, numLines: number): Promise<string> {
   const fileHandle = await fs.open(filePath, 'r');
   try {
@@ -1330,14 +1318,16 @@ export async function headFile(filePath: string, numLines: number): Promise<stri
     let buffer = '';
     let bytesRead = 0;
     const chunk = Buffer.alloc(1024); // 1KB buffer
-    
+
     // Read chunks and count lines until we have enough or reach EOF
     while (lines.length < numLines) {
       const result = await fileHandle.read(chunk, 0, chunk.length, bytesRead);
       if (result.bytesRead === 0) break; // End of file
       bytesRead += result.bytesRead;
-      buffer += chunk.slice(0, result.bytesRead).toString('utf-8');
-      
+      // Normalize CRLF before splitting so lines never carry a dangling \r
+      // (symmetric with tailFile, which normalizes as well).
+      buffer += normalizeLineEndings(chunk.slice(0, result.bytesRead).toString('utf-8'));
+
       const newLineIndex = buffer.lastIndexOf('\n');
       if (newLineIndex !== -1) {
         const completeLines = buffer.slice(0, newLineIndex).split('\n');
@@ -1348,12 +1338,12 @@ export async function headFile(filePath: string, numLines: number): Promise<stri
         }
       }
     }
-    
+
     // If there is leftover content and we still need lines, add it
     if (buffer.length > 0 && lines.length < numLines) {
       lines.push(buffer);
     }
-    
+
     return lines.join('\n');
   } finally {
     await fileHandle.close();

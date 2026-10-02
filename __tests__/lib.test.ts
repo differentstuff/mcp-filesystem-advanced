@@ -20,7 +20,7 @@ import {
   searchFilesWithValidation,
   grepFilesWithValidation,
   // File editing functions
-  applyFileEdits,
+  applyEditsToContent,
   locateEdit,
   tailFile,
   headFile
@@ -212,9 +212,33 @@ describe('Lib Functions', () => {
         expect(sliceLines('a\nb\nc\nd', 0, undefined, 2)).toBe('c\nd');
       });
 
-      it('preserves the trailing newline of the remainder', () => {
-        expect(sliceLines('a\nb\nc\n', 1, 1)).toBe('b');
+      it('treats a trailing newline as a line terminator for tail selection', () => {
+        // Editor convention, symmetric with tailFile: the last 2 lines of
+        // 'a\nb\nc\n' are 'b' and 'c', not 'c' and the phantom empty line.
+        expect(sliceLines('a\nb\nc\n', 1, undefined, 2)).toBe('b\nc');
+        expect(sliceLines('a\nb\nc\n', 0, undefined, 2)).toBe('b\nc');
+      });
+
+      it('passes the exact remainder through for offset-only (trailing newline kept)', () => {
         expect(sliceLines('a\nb\nc\n', 1)).toBe('b\nc\n');
+        expect(sliceLines('a\nb\nc', 1)).toBe('b\nc');
+        expect(sliceLines('a\nb\nc\n', 0)).toBe('a\nb\nc\n');
+      });
+
+      it('returns empty when offset equals the line count', () => {
+        expect(sliceLines('a\nb\nc\n', 3)).toBe('');
+        expect(sliceLines('a\nb\nc\n', 4)).toBe('');
+      });
+
+      it('normalizes CRLF input', () => {
+        expect(sliceLines('a\r\nb\r\nc\r\n', 1, 1)).toBe('b');
+        expect(sliceLines('a\r\nb\r\nc\r\n', 1)).toBe('b\nc\n');
+      });
+
+      it('preserves genuinely empty lines while slicing', () => {
+        // 'a\n\nb\n' has three lines: 'a', '' and 'b'.
+        expect(sliceLines('a\n\nb\n', 0, 2)).toBe('a\n');
+        expect(sliceLines('a\n\nb\n', 1)).toBe('\nb\n');
       });
     });
   });
@@ -551,212 +575,114 @@ describe('Lib Functions', () => {
   });
 
   describe('File Editing Functions', () => {
-    describe('applyFileEdits', () => {
-      beforeEach(() => {
-        mockFs.readFile.mockResolvedValue('line1\nline2\nline3\n');
-        mockFs.writeFile.mockResolvedValue(undefined);
-      });
-
-      it('applies simple text replacement', async () => {
-        const edits = [
-          { oldText: 'line2', newText: 'modified line2' }
-        ];
-        
-        mockFs.rename.mockResolvedValueOnce(undefined);
-        
-        const result = await applyFileEdits('/test/file.txt', edits, false);
-        
-        expect(result).toContain('modified line2');
-        // Should write to temporary file then rename
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
-          'line1\nmodified line2\nline3\n',
-          'utf-8'
-        );
-        expect(mockFs.rename).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+    // Note: applyFileEdits was removed — the only edit write path is the
+    // per-file batch queue (edit-queue.ts), which holds the write path lock
+    // and performs the atomic temp+rename write. Its fs-level behavior
+    // (single atomic write, dryRun writes nothing) is covered by
+    // edit-queue.test.ts. The tests below exercise the pure resolver.
+    describe('applyEditsToContent', () => {
+      it('applies simple text replacement', () => {
+        const result = applyEditsToContent(
+          'line1\nline2\nline3\n',
+          [{ oldText: 'line2', newText: 'modified line2' }],
           '/test/file.txt'
         );
+        expect(result).toBe('line1\nmodified line2\nline3\n');
       });
 
-      it('handles dry run mode', async () => {
-        const edits = [
-          { oldText: 'line2', newText: 'modified line2' }
-        ];
-        
-        const result = await applyFileEdits('/test/file.txt', edits, true);
-        
-        expect(result).toContain('modified line2');
-        expect(mockFs.writeFile).not.toHaveBeenCalled();
-      });
-
-      it('applies multiple edits sequentially', async () => {
-        const edits = [
-          { oldText: 'line1', newText: 'first line' },
-          { oldText: 'line3', newText: 'third line' }
-        ];
-        
-        mockFs.rename.mockResolvedValueOnce(undefined);
-        
-        await applyFileEdits('/test/file.txt', edits, false);
-        
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
-          'first line\nline2\nthird line\n',
-          'utf-8'
-        );
-        expect(mockFs.rename).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+      it('applies multiple edits', () => {
+        const result = applyEditsToContent(
+          'line1\nline2\nline3\n',
+          [
+            { oldText: 'line1', newText: 'first line' },
+            { oldText: 'line3', newText: 'third line' }
+          ],
           '/test/file.txt'
         );
+        expect(result).toBe('first line\nline2\nthird line\n');
       });
 
-      it('handles whitespace-flexible matching', async () => {
-        mockFs.readFile.mockResolvedValue('  line1\n    line2\n  line3\n');
-        
-        const edits = [
-          { oldText: 'line2', newText: 'modified line2' }
-        ];
-        
-        mockFs.rename.mockResolvedValueOnce(undefined);
-        
-        await applyFileEdits('/test/file.txt', edits, false);
-        
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
-          '  line1\n    modified line2\n  line3\n',
-          'utf-8'
-        );
-        expect(mockFs.rename).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+      it('handles whitespace-flexible matching', () => {
+        const result = applyEditsToContent(
+          '  line1\n    line2\n  line3\n',
+          [{ oldText: 'line2', newText: 'modified line2' }],
           '/test/file.txt'
         );
+        expect(result).toBe('  line1\n    modified line2\n  line3\n');
       });
 
-      it('throws error for non-matching edits', async () => {
-        const edits = [
-          { oldText: 'nonexistent line', newText: 'replacement' }
-        ];
-
-        // Updated to match current error contract: EDIT FAILED — NOTHING WAS
-        // WRITTEN, with a line-number hint
-        await expect(applyFileEdits('/test/file.txt', edits, false))
-          .rejects.toThrow('EDIT FAILED — NOTHING WAS WRITTEN');
+      it('throws error for non-matching edits', () => {
+        // Current error contract: EDIT FAILED — NOTHING WAS WRITTEN, with a
+        // line-number hint
+        expect(() =>
+          applyEditsToContent('line1\nline2\nline3\n', [{ oldText: 'nonexistent line', newText: 'replacement' }], '/test/file.txt')
+        ).toThrow('EDIT FAILED — NOTHING WAS WRITTEN');
       });
 
-      it('handles complex multi-line edits with indentation', async () => {
-        mockFs.readFile.mockResolvedValue('function test() {\n  console.log("hello");\n  return true;\n}');
-        
-        const edits = [
-          { 
-            oldText: '  console.log("hello");\n  return true;', 
-            newText: '  console.log("world");\n  console.log("test");\n  return false;' 
-          }
-        ];
-        
-        mockFs.rename.mockResolvedValueOnce(undefined);
-        
-        await applyFileEdits('/test/file.js', edits, false);
-        
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.js\.[a-f0-9]+\.tmp$/),
-          'function test() {\n  console.log("world");\n  console.log("test");\n  return false;\n}',
-          'utf-8'
-        );
-        expect(mockFs.rename).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.js\.[a-f0-9]+\.tmp$/),
+      it('handles complex multi-line edits with indentation', () => {
+        const result = applyEditsToContent(
+          'function test() {\n  console.log("hello");\n  return true;\n}',
+          [{
+            oldText: '  console.log("hello");\n  return true;',
+            newText: '  console.log("world");\n  console.log("test");\n  return false;'
+          }],
           '/test/file.js'
         );
+        expect(result).toBe('function test() {\n  console.log("world");\n  console.log("test");\n  return false;\n}');
       });
 
-      it('handles edits with different indentation patterns', async () => {
-        mockFs.readFile.mockResolvedValue('    if (condition) {\n        doSomething();\n    }');
-        
-        const edits = [
-          { 
-            oldText: 'doSomething();', 
-            newText: 'doSomethingElse();\n        doAnotherThing();' 
-          }
-        ];
-        
-        mockFs.rename.mockResolvedValueOnce(undefined);
-        
-        await applyFileEdits('/test/file.js', edits, false);
-        
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.js\.[a-f0-9]+\.tmp$/),
-          '    if (condition) {\n        doSomethingElse();\n        doAnotherThing();\n    }',
-          'utf-8'
-        );
-        expect(mockFs.rename).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.js\.[a-f0-9]+\.tmp$/),
+      it('handles edits with different indentation patterns', () => {
+        const result = applyEditsToContent(
+          '    if (condition) {\n        doSomething();\n    }',
+          [{
+            oldText: 'doSomething();',
+            newText: 'doSomethingElse();\n        doAnotherThing();'
+          }],
           '/test/file.js'
         );
+        expect(result).toBe('    if (condition) {\n        doSomethingElse();\n        doAnotherThing();\n    }');
       });
 
-      it('handles CRLF line endings in file content', async () => {
-        mockFs.readFile.mockResolvedValue('line1\r\nline2\r\nline3\r\n');
-
-        const edits = [
-          { oldText: 'line2', newText: 'modified line2' }
-        ];
-
-        mockFs.rename.mockResolvedValueOnce(undefined);
-
-        await applyFileEdits('/test/file.txt', edits, false);
-
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
-          'line1\nmodified line2\nline3\n',
-          'utf-8'
-        );
-        expect(mockFs.rename).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
+      it('normalizes CRLF in edit texts against LF content', () => {
+        // The resolver is pure: file-content normalization is the caller's
+        // job (the edit queue normalizes the base it reads; see
+        // edit-queue.test.ts). Edit oldText/newText are normalized here.
+        const result = applyEditsToContent(
+          'line1\nline2\nline3\n',
+          [{ oldText: 'line2\r\n', newText: 'modified line2\r\n' }],
           '/test/file.txt'
         );
+        expect(result).toBe('line1\nmodified line2\nline3\n');
       });
 
-      it('fails with EDIT FAILED ambiguous for multi-occurrence oldText instead of replacing the first', async () => {
-        mockFs.readFile.mockResolvedValue('dup\nX\ndup\nY\n');
-        mockFs.writeFile.mockResolvedValue(undefined);
-
-        await expect(applyFileEdits('/test/file.txt', [{ oldText: 'dup', newText: 'Z' }], false))
-          .rejects.toThrow(/EDIT FAILED — NOTHING WAS WRITTEN[\s\S]*ambiguous[\s\S]*matches lines 1, 3/);
-        expect(mockFs.writeFile).not.toHaveBeenCalled();
+      it('fails with EDIT FAILED ambiguous for multi-occurrence oldText instead of replacing the first', () => {
+        expect(() =>
+          applyEditsToContent('dup\nX\ndup\nY\n', [{ oldText: 'dup', newText: 'Z' }], '/test/file.txt')
+        ).toThrow(/EDIT FAILED — NOTHING WAS WRITTEN[\s\S]*ambiguous[\s\S]*matches lines 1, 3/);
       });
 
-      it('resolves ambiguous oldText via context expansion when one candidate has unique context', async () => {
+      it('resolves ambiguous oldText via context expansion when one candidate has unique context', () => {
         // 'Q' occurs four times: three inside the repeated 'K Q' block (their
         // ±context repeats too), one with unique context (M Q N). Context
         // expansion resolves to line 9.
-        mockFs.readFile.mockResolvedValue('K\nQ\nK\nQ\nK\nQ\nK\nM\nQ\nN\n');
-        mockFs.writeFile.mockResolvedValue(undefined);
-        mockFs.rename.mockResolvedValue(undefined);
-
-        await applyFileEdits('/test/file.txt', [{ oldText: 'Q', newText: 'QX' }], false);
-
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
-          'K\nQ\nK\nQ\nK\nQ\nK\nM\nQX\nN\n',
-          'utf-8'
+        const result = applyEditsToContent(
+          'K\nQ\nK\nQ\nK\nQ\nK\nM\nQ\nN\n',
+          [{ oldText: 'Q', newText: 'QX' }],
+          '/test/file.txt'
         );
+        expect(result).toBe('K\nQ\nK\nQ\nK\nQ\nK\nM\nQX\nN\n');
       });
 
-      it('handles chained edits where edit 2 references edit 1 output', async () => {
-        mockFs.readFile.mockResolvedValue('A1\nA2\nA3\n');
-        mockFs.writeFile.mockResolvedValue(undefined);
-        mockFs.rename.mockResolvedValue(undefined);
-
-        await applyFileEdits('/test/file.txt', [
-          { oldText: 'A1', newText: 'A1-beta' },
-          { oldText: 'A1-beta', newText: 'A1-gamma' }
-        ], false);
-
-        expect(mockFs.writeFile).toHaveBeenCalledWith(
-          expect.stringMatching(/\/test\/file\.txt\.[a-f0-9]+\.tmp$/),
-          'A1-gamma\nA2\nA3\n',
-          'utf-8'
+      it('handles chained edits where edit 2 references edit 1 output', () => {
+        const result = applyEditsToContent(
+          'A1\nA2\nA3\n',
+          [
+            { oldText: 'A1', newText: 'A1-beta' },
+            { oldText: 'A1-beta', newText: 'A1-gamma' }
+          ],
+          '/test/file.txt'
         );
+        expect(result).toBe('A1-gamma\nA2\nA3\n');
       });
     });
 
@@ -852,16 +778,47 @@ describe('Lib Functions', () => {
         expect(result).toBe('line 299\nline 300');
       });
 
-      it('counts the empty string after a trailing newline as a line (current convention)', async () => {
-        // Pins current behavior: 'a\nb\nc\n' splits into ['a','b','c',''],
-        // so tail=2 returns 'c\n'. If the convention ever changes to editor
-        // semantics ('b\nc'), update this test deliberately.
+      it('treats a trailing newline as a line terminator, not an extra empty line', async () => {
+        // Editor convention, symmetric with headFile: 'a\nb\nc\n' has three
+        // lines, so tail=2 returns lines 2-3 ('b\nc'), not 'c\n'.
         mockFileBytes('line1\nline2\nline3\n');
         mockFs.stat.mockResolvedValue({ size: 18 } as any);
 
         const result = await tailFile('/test/file.txt', 2);
 
-        expect(result).toBe('line3\n');
+        expect(result).toBe('line2\nline3');
+      });
+
+      it('returns all lines when tail exceeds the line count (no trailing newline in output)', async () => {
+        // Symmetric with headFile: line selection joins with LF and never
+        // appends a trailing newline.
+        mockFileBytes('line1\nline2\nline3\n');
+        mockFs.stat.mockResolvedValue({ size: 18 } as any);
+
+        const result = await tailFile('/test/file.txt', 10);
+
+        expect(result).toBe('line1\nline2\nline3');
+      });
+
+      it('normalizes CRLF line endings', async () => {
+        mockFileBytes('line1\r\nline2\r\nline3\r\n');
+        mockFs.stat.mockResolvedValue({ size: 24 } as any);
+
+        const result = await tailFile('/test/file.txt', 2);
+
+        expect(result).toBe('line2\nline3');
+      });
+
+      it('preserves genuinely empty lines inside the tail', async () => {
+        // 'a\n\nb\n' has three lines: 'a', '' and 'b'. The trailing-newline
+        // fix must only drop the position AFTER the final newline, never a
+        // real empty line.
+        mockFileBytes('a\n\nb\n');
+        mockFs.stat.mockResolvedValue({ size: 6 } as any);
+
+        const result = await tailFile('/test/file.txt', 3);
+
+        expect(result).toBe('a\n\nb');
       });
 
       it('rejects and still closes the handle when a read fails', async () => {
@@ -917,6 +874,14 @@ describe('Lib Functions', () => {
         const result = await headFile('/test/file.txt', 2);
 
         expect(result).toBe('line 001\nline 002');
+      });
+
+      it('normalizes CRLF line endings (no dangling \\r on lines)', async () => {
+        mockFileBytes('line1\r\nline2\r\nline3\r\n');
+
+        const result = await headFile('/test/file.txt', 2);
+
+        expect(result).toBe('line1\nline2');
       });
 
       it('rejects and still closes the handle when a read fails', async () => {

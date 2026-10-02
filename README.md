@@ -190,7 +190,7 @@ For any MCP-compatible client:
 
 | Tool | Description |
 |------|-------------|
-| `read_text_file` | Read file contents (with optional head/tail, plus `offset` applied BEFORE head/tail for paging: offset=100, head=50 returns lines 101-150) |
+| `read_text_file` | Read file contents as LF-normalized text (head/tail/offset line selection, editor convention; `offset` applies BEFORE head/tail for paging: offset=100, head=50 returns lines 101-150) |
 | `read_media_file` | Read image/audio files as base64 |
 | `read_multiple_files` | Read multiple files at once |
 | `write_file` | Write file (auto-creates parent dirs) |
@@ -228,6 +228,24 @@ For any MCP-compatible client:
 - **Default exclusions**: `node_modules`, `.git`, lock files, build outputs, etc. are always skipped unless `includeIgnored: true`; user `excludePatterns` / `filePattern` apply on top.
 
 ## Enhanced Behavior
+
+### Reading Files (line conventions)
+
+All text reads return **LF line endings** (CRLF input is normalized), and all
+line-selection options use **editor convention**: a trailing newline
+terminates the last line, it does not start an extra empty one.
+
+```javascript
+// File content: "a\nb\nc\n"  (3 lines)
+read_text_file(path, { tail: 2 })          // → "b\nc"   (not "c\n")
+read_text_file(path, { head: 2 })          // → "a\nb"
+read_text_file(path, { offset: 1 })        // → "b\nc\n" (exact remainder)
+read_text_file(path, { offset: 1, head: 1 }) // → "b"
+get_file_info(path)                        // → lineCount: 3
+```
+
+`offset` is applied BEFORE `head`/`tail`, so `offset=100, head=50` returns
+lines 101-150. Use `get_file_info`'s `lineCount` to plan paged reads.
 
 ### Auto-Create Parent Directories
 

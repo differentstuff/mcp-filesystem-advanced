@@ -11,6 +11,7 @@ import { getValidRootDirectories } from './roots-utils.js';
 import {
   // Function imports
   formatSize,
+  normalizeLineEndings,
   validatePath,
   getFileStats,
   readFileContent,
@@ -101,8 +102,10 @@ setAllowedDirectories(allowedDirectories);
 // Schema definitions
 const ReadTextFileArgsSchema = z.object({
   path: z.string(),
-  tail: z.number().optional().describe('If provided, returns only the last N lines of the remainder (after offset is applied)'),
-  head: z.number().optional().describe('If provided, returns only the first N lines of the remainder (after offset is applied)'),
+  tail: z.number().int().min(0).optional()
+    .describe('If provided, returns only the last N lines of the file (editor convention: a trailing newline terminates the last line, it does not start an extra empty one)'),
+  head: z.number().int().min(0).optional()
+    .describe('If provided, returns only the first N lines of the file'),
   offset: z.number().int().min(0).optional().default(0)
     .describe('0-based line offset: skip the first N lines before returning. Applied BEFORE head/tail. Combine with head to page through a file: offset=100, head=50 returns lines 101-150.')
 });
@@ -130,7 +133,7 @@ const EditOperation = z.object({
 
 const EditFileArgsSchema = z.object({
   path: z.string(),
-  edits: z.array(EditOperation),
+  edits: z.array(EditOperation).min(1, "At least one edit must be provided"),
   dryRun: z.boolean().default(false).describe('Preview changes using git-style diff format')
 });
 
@@ -215,6 +218,11 @@ async function readFileAsBase64Stream(filePath: string): Promise<string> {
 // Tool registrations
 
 // read_file (deprecated) and read_text_file
+//
+// Line-ending contract: every path through this handler returns LF-normalized
+// text. head/tail/offset are line-selection operations (editor convention: a
+// trailing newline terminates a line, it does not start an extra empty one),
+// and the plain full read is normalized too so all paths agree.
 const readTextFileHandler = async (args: z.infer<typeof ReadTextFileArgsSchema>) => {
   const validPath = await validatePath(args.path);
 
@@ -236,7 +244,7 @@ const readTextFileHandler = async (args: z.infer<typeof ReadTextFileArgsSchema>)
   if (args.head) {
     return await headFile(validPath, args.head);
   }
-  return await readFileContent(validPath);
+  return normalizeLineEndings(await readFileContent(validPath));
 };
 
 server.addTool({
@@ -255,9 +263,12 @@ server.addTool({
     "if the file cannot be read. Use this tool when you need to examine " +
     "the contents of a single file. Use the 'head' parameter to read only " +
     "the first N lines of a file, or the 'tail' parameter to read only " +
-    "the last N lines of a file. Use 'offset' to skip the first N lines " +
-    "before head/tail are applied — combine offset with head to page " +
-    "through a file (offset=100, head=50 returns lines 101-150). " +
+    "the last N lines of a file (editor convention: a trailing newline " +
+    "terminates the last line, it does not start an extra empty one). " +
+    "Use 'offset' to skip the first N lines before head/tail are applied — " +
+    "combine offset with head to page through a file (offset=100, head=50 " +
+    "returns lines 101-150; get_file_info's lineCount gives you the total). " +
+    "All text is returned with LF line endings. " +
     "Operates on the file as text regardless of extension. " +
     "Only works within allowed directories.",
   parameters: ReadTextFileArgsSchema,
@@ -270,9 +281,7 @@ server.addTool({
   description:
     "Read an image or audio file. Returns the base64 encoded data and MIME type. " +
     "Only works within allowed directories.",
-  parameters: z.object({
-    path: z.string()
-  }),
+  parameters: ReadMediaFileArgsSchema,
   execute: async (args: z.infer<typeof ReadMediaFileArgsSchema>) => {
     const validPath = await validatePath(args.path);
     const extension = path.extname(validPath).toLowerCase();
@@ -313,17 +322,14 @@ server.addTool({
     "or compare multiple files. Each file's content is returned with its " +
     "path as a reference. Failed reads for individual files won't stop " +
     "the entire operation. Only works within allowed directories.",
-  parameters: z.object({
-    paths: z.array(z.string())
-      .min(1)
-      .describe("Array of file paths to read. Each path must be a string pointing to a valid file within allowed directories.")
-  }),
+  parameters: ReadMultipleFilesArgsSchema,
   execute: async (args: z.infer<typeof ReadMultipleFilesArgsSchema>) => {
     const results = await Promise.all(
       args.paths.map(async (filePath: string) => {
         try {
           const validPath = await validatePath(filePath);
-          const content = await readFileContent(validPath);
+          // LF-normalized, consistent with read_text_file
+          const content = normalizeLineEndings(await readFileContent(validPath));
           return `${filePath}:\n${content}\n`;
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
@@ -344,10 +350,7 @@ server.addTool({
     "Handles text content with proper encoding. " +
     "IMPORTANT: This tool automatically creates parent directories if they don't exist. " +
     "Only works within allowed directories.",
-  parameters: z.object({
-    path: z.string(),
-    content: z.string()
-  }),
+  parameters: WriteFileArgsSchema,
   execute: async (args: z.infer<typeof WriteFileArgsSchema>) => {
     const result = await writeFileContent(args.path, args.content);
     
@@ -383,14 +386,7 @@ server.addTool({
     "one atomic write, while overlapping concurrent edits are rejected with " +
     "EDIT_CONFLICT naming both spans. Returns a success summary and a git-style " +
     "diff showing the changes made. Only works within allowed directories.",
-  parameters: z.object({
-    path: z.string(),
-    edits: z.array(z.object({
-      oldText: z.string().describe("Text to search for - must match exactly and uniquely; ambiguous matches are rejected"),
-      newText: z.string().describe("Text to replace with")
-    })),
-    dryRun: z.boolean().default(false).describe("Preview changes using git-style diff format")
-  }),
+  parameters: EditFileArgsSchema,
   execute: async (args: z.infer<typeof EditFileArgsSchema>) => {
     const validPath = await validatePath(args.path);
     return await enqueueEdits(validPath, args.edits, args.dryRun);
@@ -407,9 +403,7 @@ server.addTool({
     "structures for projects or ensuring required paths exist. " +
     "IMPORTANT: This tool automatically creates parent directories if they don't exist. " +
     "Only works within allowed directories.",
-  parameters: z.object({
-    path: z.string()
-  }),
+  parameters: CreateDirectoryArgsSchema,
   execute: async (args: z.infer<typeof CreateDirectoryArgsSchema>) => {
     const validPath = await validatePath(args.path, { allowMissingParent: true });
     const result = await createDirectoryRecursive(validPath);
@@ -444,9 +438,7 @@ server.addTool({
     "Use this when you want to set up directory structures before other operations. " +
     "IMPORTANT: This tool automatically creates parent directories if they don't exist. " +
     "Only works within allowed directories.",
-  parameters: z.object({
-    path: z.string()
-  }),
+  parameters: EnsureDirectoryArgsSchema,
   execute: async (args: z.infer<typeof EnsureDirectoryArgsSchema>) => {
     const validPath = await validatePath(args.path, { allowMissingParent: true });
     const result = await createDirectoryRecursive(validPath);
@@ -479,9 +471,7 @@ server.addTool({
     "Results clearly distinguish between files and directories with [FILE] and [DIR] " +
     "prefixes. This tool is essential for understanding directory structure and " +
     "finding specific files within a directory. Only works within allowed directories.",
-  parameters: z.object({
-    path: z.string()
-  }),
+  parameters: ListDirectoryArgsSchema,
   execute: async (args: z.infer<typeof ListDirectoryArgsSchema>) => {
     const validPath = await validatePath(args.path);
     const entries = await fs.readdir(validPath, { withFileTypes: true });
@@ -499,10 +489,7 @@ server.addTool({
     "Results clearly distinguish between files and directories with [FILE] and [DIR] " +
     "prefixes. This tool is useful for understanding directory structure and " +
     "finding specific files within a directory. Only works within allowed directories.",
-  parameters: z.object({
-    path: z.string(),
-    sortBy: z.enum(["name", "size"]).optional().default("name").describe("Sort entries by name or size")
-  }),
+  parameters: ListDirectoryWithSizesArgsSchema,
   execute: async (args: z.infer<typeof ListDirectoryWithSizesArgsSchema>) => {
     const validPath = await validatePath(args.path);
     const entries = await fs.readdir(validPath, { withFileTypes: true });
@@ -569,10 +556,7 @@ server.addTool({
     "Each entry includes 'name', 'type' (file/directory), and 'children' for directories. " +
     "Files have no children array, while directories always have a children array (which may be empty). " +
     "The output is formatted with 2-space indentation for readability. Only works within allowed directories.",
-  parameters: z.object({
-    path: z.string(),
-    excludePatterns: z.array(z.string()).optional().default([])
-  }),
+  parameters: DirectoryTreeArgsSchema,
   execute: async (args: z.infer<typeof DirectoryTreeArgsSchema>) => {
     interface TreeEntry {
       name: string;
@@ -632,10 +616,7 @@ server.addTool({
     "for simple renaming within the same directory. " +
     "IMPORTANT: This tool automatically creates parent directories for the destination if they don't exist. " +
     "Both source and destination must be within allowed directories.",
-  parameters: z.object({
-    source: z.string(),
-    destination: z.string()
-  }),
+  parameters: MoveFileArgsSchema,
   execute: async (args: z.infer<typeof MoveFileArgsSchema>) => {
     // Lock both source and destination for the move
     return withPathLock(args.source, 'move', async () => {
@@ -676,11 +657,7 @@ server.addTool({
     "To search file CONTENTS (e.g., find where a function or string is defined), use grep_files instead. " +
     "Returns full paths to all matching items. " +
     "Only searches within allowed directories.",
-  parameters: z.object({
-    path: z.string(),
-    pattern: z.string(),
-    excludePatterns: z.array(z.string()).optional().default([])
-  }),
+  parameters: SearchFilesArgsSchema,
   execute: async (args: z.infer<typeof SearchFilesArgsSchema>) => {
     const validPath = await validatePath(args.path);
     const results = await searchFilesWithValidation(validPath, args.pattern, allowedDirectories, { excludePatterns: args.excludePatterns });
@@ -728,11 +705,12 @@ server.addTool({
   description:
     "Retrieve detailed metadata about a file or directory. Returns comprehensive " +
     "information including size, creation time, last modified time, permissions, " +
-    "and type. This tool is perfect for understanding file characteristics " +
-    "without reading the actual content. Only works within allowed directories.",
-  parameters: z.object({
-    path: z.string()
-  }),
+    "type, and — for files — lineCount (editor convention: a trailing newline " +
+    "terminates the last line, it does not start an extra empty one). This tool " +
+    "is perfect for understanding file characteristics without reading the actual " +
+    "content, and lineCount helps plan paged reads with read_text_file. " +
+    "Only works within allowed directories.",
+  parameters: GetFileInfoArgsSchema,
   execute: async (args: z.infer<typeof GetFileInfoArgsSchema>) => {
     const validPath = await validatePath(args.path);
     const info = await getFileStats(validPath);

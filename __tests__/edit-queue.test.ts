@@ -211,6 +211,23 @@ describe('edit-queue', () => {
     });
   });
 
+  describe('CRLF file content', () => {
+    it('normalizes the base to LF before matching and stores LF', async () => {
+      const content = 'line1\r\nline2\r\nline3\r\n';
+      mockFs.readFile.mockResolvedValue(content);
+      mockFs.stat.mockResolvedValue({ mtimeMs: 1000, size: content.length });
+      mockFs.writeFile.mockResolvedValue(undefined);
+      mockFs.rename.mockResolvedValue(undefined);
+
+      const result = await enqueueEdits(FILE_PATH, [{ oldText: 'line2', newText: 'modified line2' }], false);
+
+      expect(result).toContain('diff');
+      expect(mockFs.writeFile).toHaveBeenCalledTimes(1);
+      const written = mockFs.writeFile.mock.calls[0][1] as string;
+      expect(written).toBe('line1\nmodified line2\nline3\n');
+    });
+  });
+
   describe('dryRun', () => {
     it('previews the diff without queue participation and without writing', async () => {
       const content = 'A1\nA2\nA3\n';

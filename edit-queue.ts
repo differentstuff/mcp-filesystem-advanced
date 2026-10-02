@@ -356,8 +356,8 @@ async function flushBatch(batch: ActiveBatch): Promise<void> {
         }
 
         const merged = mergeSpans(batch);
-        // Security: atomic rename, same pattern as applyFileEdits — replaces
-        // the target atomically and does not follow symlinks.
+        // Security: atomic rename — replaces the target atomically and does
+        // not follow symlinks.
         const tempPath = `${batch.filePath}.${randomBytes(16).toString('hex')}.tmp`;
         try {
           await fs.writeFile(tempPath, merged, 'utf-8');
